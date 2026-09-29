@@ -216,6 +216,7 @@ static void *GZ(const char *n) {
     return p;
 }
 
+static BOOL gzz_thread_ok = NO;
 static BOOL gzz_api_init(void) {
     if (g_apiReady) return YES;
     if (!g_unityBase) gzz_find_base();
@@ -261,8 +262,13 @@ static BOOL gzz_api_init(void) {
           A.domain_get, A.class_from_name);
         return NO;
     }
+    // 主线程通常已被 Unity attach; 若未 attach 会导致 il2cpp 调用崩溃 → 先补一次
+    if (A.thread_current && A.thread_attach) {
+        if (!A.thread_current()) { A.thread_attach(A.domain_get()); L("api: 已 attach 当前线程"); }
+        gzz_thread_ok = YES;
+    }
     g_apiReady = YES;
-    L("api ✓ il2cpp C API 就绪 (domain_get=%p)", A.domain_get);
+    L("api ✓ il2cpp C API 就绪 (domain_get=%p thread=%d)", A.domain_get, (int)gzz_thread_ok);
     return YES;
 }
 
@@ -478,22 +484,31 @@ static int gzz_kill_enemies(void) {
 
 // ② 回合战斗: 找到活着的 BattlePanel, 调 TiaoGuo() 立即结算
 //    每个实例只跳一次, 确保任何新开的战斗都被秒跳
+#define GZZ_SEEN_MAX 64
+#define GZZ_SEEN_TTL 30        // 秒; 超过则视为新战斗, 允许重跳
+static Il2CppObject *g_seenPtr[GZZ_SEEN_MAX];
+static int            g_seenAge[GZZ_SEEN_MAX];
+static int            g_seenN = 0;
+
 static int gzz_autoskip(void) {
     static Il2CppObject *buf[64];
-    static Il2CppObject *seen[128];
-    static int seenN = 0;
     if (!k_bp || !mi_bp_TiaoGuo || !mi_bp_TiaoGuo->methodPointer) return 0;
+    for (int j = 0; j < g_seenN; j++) g_seenAge[j]++;
     int n = gzz_find_objects(k_bp, buf, 64);
     int did = 0;
     for (int i = 0; i < n; i++) {
-        int known = 0;
-        for (int j = 0; j < seenN; j++) if (seen[j] == buf[i]) { known = 1; break; }
-        if (known) continue;
-        if (seenN < 128) seen[seenN++] = buf[i];
-        else { for (int j = 0; j < 64; j++) seen[j] = seen[j + 64]; seenN = 64; }
+        int slot = -1;
+        for (int j = 0; j < g_seenN; j++) {
+            if (g_seenPtr[j] == buf[i]) { slot = j; break; }
+        }
+        if (slot >= 0 && g_seenAge[slot] < GZZ_SEEN_TTL * 2) continue;   // 2Hz → 30s
+        if (slot >= 0) { g_seenAge[slot] = 0; }
+        else if (g_seenN < GZZ_SEEN_MAX) { g_seenPtr[g_seenN] = buf[i]; g_seenAge[g_seenN] = 0; g_seenN++; }
+        else { for (int j = 0; j < GZZ_SEEN_MAX / 2; j++) { g_seenPtr[j] = g_seenPtr[j + GZZ_SEEN_MAX / 2]; g_seenAge[j] = g_seenAge[j + GZZ_SEEN_MAX / 2]; } g_seenN = GZZ_SEEN_MAX / 2;
+               g_seenPtr[g_seenN] = buf[i]; g_seenAge[g_seenN] = 0; g_seenN++; }
         A.runtime_invoke(mi_bp_TiaoGuo, buf[i], NULL, NULL);
         did++;
-        L("kill: 自动跳过战斗 (BattlePanel=%p, 场景内 %d 个)", buf[i], n);
+        L("kill: 自动跳过战斗 (BattlePanel=%p, 场景内 %d 个, 累计 %ld)", buf[i], n, (long)(g_nSkip + 1));
     }
     if (did) g_nSkip += did;
     return did;
@@ -605,7 +620,6 @@ static int gzz_boost_panel(void) {
 }
 
 static void gzz_kill_pass(void) {
-    gzz_probe_once();
     if (!g_killOn) return;
     g_lastKillN = gzz_kill_enemies() + gzz_kill_units();
     g_lastSkipN = gzz_autoskip();
@@ -795,10 +809,13 @@ static void gzz_tick(void) {
         static int c = 0;
         if ((++c % 15) == 0) { gzz_apply_timescale(); gzz_boost_panel(); }
     }
-    // 秒杀: 每 0.25s 跑一轮 (FindObjectsOfType + 真实业务方法)
-    if (g_killOn && g_apiReady && g_tgtDone >= GZZ_NTGT) {
+    // 目标全部解析完毕后: 先跑一次场景探针 (一次性诊断), 再按开关执行秒杀
+    if (g_apiReady && g_tgtDone >= GZZ_NTGT) {
         static int k = 0;
-        if ((++k % 15) == 0) gzz_kill_pass();
+        if ((++k % 15) == 0) {
+            gzz_probe_once();
+            if (g_killOn) gzz_kill_pass();
+        }
     }
     if (g_stat) g_stat.text = gzz_stat_text();
 }
