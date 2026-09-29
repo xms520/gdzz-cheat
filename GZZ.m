@@ -1,24 +1,27 @@
 //
-//  GZZ.m — 古代战争 2.4.1 (com.maobu.jiushizhuunity) 悬浮助手 v1
+//  GZZ.m — 古代战争 2.4.1 (com.maobu.jiushizhuunity) 悬浮助手 v3
 //  ═══════════════════════════════════════════════════════════════════════
-//  引擎: Unity 2019.4.30f1 + IL2CPP (global-metadata v24.2) + xLua 热更(明文)
-//  二进制: Frameworks/UnityFramework.framework/UnityFramework (arm64, 90.7MB, 229 个 il2cpp_* 导出)
-//  主程序: JiuShiZhuUnityIOS (70KB 壳, 逻辑全在 UnityFramework)
+//  v3 修复 (依据真机 gdzz.log + gdzz_scan.txt 判决)
 //
-//  功能:
-//   ① 秒杀  —— 三条并行策略 (各自带命中计数, 真机日志可判定哪条生效)
-//       a) 自动跳过战斗: hook BattlePanel::Update → 战斗开始 N 帧后自动调
-//          BattlePanel::TiaoGuo(), 客户端瞬间出结果 (最稳, 不依赖数值注入)
-//       b) 飞机大战(FeiJi)敌人秒杀: hook FeiJiEnemy::Damage(float)
-//       c) 客户端战斗单元血线归零: hook BattleHeroCell::ChangeHp
-//   ② 加速  —— hook UnityEngine.Time::set_timeScale 做倍率放大 +
-//              主线程 0.5s 定时器持续钉住 (对抗游戏自身重置)
+//  ⚠️ 崩溃/卡死根因 (全部为"写错偏移", 已彻底移除该类操作):
+//   ① 加速闪退: 日志 `bp._timeScale=0` —— il2cpp_field_get_offset 返回 0,
+//      我据此执行 `*(float*)(obj+0)=3.0f`, 砸掉对象头部的 klass 指针 → 必崩。
+//      → v3 删除 boost_panel, 只走 UnityEngine.Time.set_timeScale。
+//   ② 秒杀卡死: 日志显示 10~12 个 BattleHeroCell 实例被处理。
+//      我向 hp(off=32) 写 0 —— 而 hp 的 typeIdx=46373 是 UnityEngine.UI.Image
+//      (同型字段都是 icon/imgBar/imgDongLi), 即"血条图片引用", 写 0 → 空引用;
+//      maxHp(off=216) 实测恒读 0 (偏移不可信)。
+//      → v3 删除全部 BattleHeroCell 字段写入与该路径。
+//   ③ 强制胜利: scan 显示 BattleModel.UpdateResult(LitJson.JsonData) 形参是
+//      对象而非 int → 传 int 必崩。→ v3 删除该功能。
+//   ④ 日志 `%@` 在 vsnprintf 中不受支持 → 变参错位 (旧坑第 3 次复现)。
+//      → v3 全部改用 %s + .UTF8String。
+//   ⑤ CAMP_ATTACK_ROLE/CAMP_DEFENCE_ROLE 静态读回 0, 而实测 meCamp 为 1/2
+//      → v3 不再伪造阵营值, 也不再做阵营相关的血量操作。
 //
-//  ⚠️ 该游戏【回合战斗结算为服务端权威】(BattleLog 由服务器下发), 伤害数值
-//     注入只对客户端小游戏(飞机大战/探索)有效, 主线回合战斗用「自动跳过」
-//     达成等效的快速通关。所有 hook 目标均在真机解析成功后才安装,
-//     缺一个不影响其余功能。
-//  ⚠️ 仅单机/单人玩法使用。竞技场(JJC)、跨服、组队为联机, 勿开秒杀。
+//  v3 功能 (全部只调用游戏自己的业务方法, 不写任何裸偏移):
+//   ① 秒杀 = 自动跳过战斗 (BattlePanel::TiaoGuo) + 飞机大战敌人 (FeiJiEnemy::Damage)
+//   ② 加速 = 周期性调用 UnityEngine.Time::set_timeScale
 //  ═══════════════════════════════════════════════════════════════════════
 
 #import <UIKit/UIKit.h>
@@ -33,10 +36,7 @@
 #include <stdlib.h>
 #include <stdarg.h>
 #include <math.h>
-#include <signal.h>
 #include <unistd.h>
-#include <sys/mman.h>
-#include <libkern/OSCacheControl.h>
 
 // ───────────────────────── 日志 ─────────────────────────
 static NSString *g_doc = nil;
@@ -47,6 +47,7 @@ static NSString *gzz_doc(void) {
     }
     return g_doc;
 }
+// ⚠️ 只用 %s/%d/%ld/%p 等 C 格式; 严禁 %@ (vsnprintf 不支持, 会导致变参错位)
 static void L(const char *fmt, ...) {
     char msg[1024];
     va_list ap; va_start(ap, fmt);
@@ -64,27 +65,23 @@ static void L(const char *fmt, ...) {
 // ───────────────────────── 开关 / 计数 ─────────────────────────
 static BOOL  g_killOn   = NO;
 static BOOL  g_speedOn  = NO;
-static float g_speedMul = 3.0f;
-static BOOL  g_forceWin = NO;     // 强制胜利 (默认关, 需真机验证)
-static int   g_myCamp   = -1;     // 我方阵营 (运行时读 BattleModel 静态常量)
+static float g_speedMul = 2.0f;
 
-static volatile int g_nSkip     = 0;   // 自动跳过战斗次数
-static volatile int g_nDamage   = 0;   // FeiJiEnemy::Damage 命中
-static volatile int g_nChangeHp = 0;   // BattleHeroCell::ChangeHp 命中
-static volatile int g_nMapAtk   = 0;   // MapHeroCell::Attack 命中
-static volatile int g_tsSets    = 0;   // set_timeScale 拦截
+static volatile int g_nSkip   = 0;   // 自动跳过战斗次数
+static volatile int g_nDamage = 0;   // FeiJiEnemy::Damage 调用次数
+static volatile int g_nTsSet  = 0;   // set_timeScale 调用次数
+static volatile int g_nExc    = 0;   // C# 异常次数 (关键诊断)
 
+static UIWindow *g_win  = nil;
 static UIButton *g_ball = nil;
 static UIView   *g_panel = nil;
 static UILabel  *g_stat = nil;
-static UISwitch *g_swKill = nil, *g_swSpeed = nil, *g_swWin = nil;
-static UIWindow *g_win = nil;
+static UISwitch *g_swKill = nil, *g_swSpeed = nil;
 static UISegmentedControl *g_segSpeed = nil;
 
-// ───────────────────────── Mach-O ─────────────────────────
+// ───────────────────────── Mach-O (仅用于日志/基址诊断) ─────────────────────────
 static uint64_t g_unityBase = 0;
 static uint64_t g_textSize  = 0;
-static int      g_slide     = 0;
 
 static void gzz_find_base(void) {
     if (g_unityBase) return;
@@ -94,10 +91,9 @@ static void gzz_find_base(void) {
         if (!nm || !strstr(nm, "UnityFramework")) continue;
         const struct mach_header *h = _dyld_get_image_header(i);
         if (!h || h->magic != MH_MAGIC_64) continue;
-        g_slide = _dyld_get_image_vmaddr_slide(i);
         g_unityBase = (uint64_t)h;
-        const uint8_t *p = (const uint8_t *)h + sizeof(struct mach_header_64);
         const struct mach_header_64 *mh = (const struct mach_header_64 *)h;
+        const uint8_t *p = (const uint8_t *)h + sizeof(struct mach_header_64);
         for (uint32_t c = 0; c < mh->ncmds; c++) {
             const struct load_command *lc = (const struct load_command *)p;
             if (lc->cmd == LC_SEGMENT_64) {
@@ -106,67 +102,13 @@ static void gzz_find_base(void) {
             }
             p += lc->cmdsize;
         }
-        L("base: UnityFramework %p slide=0x%x __TEXT size=0x%llx", h, (unsigned)g_slide, g_textSize);
+        L("base: UnityFramework %p __TEXT size=0x%llx", h, g_textSize);
         return;
     }
 }
-static int gzz_ptr_in_text(uintptr_t a) {
-    return (a && a >= g_unityBase && a < g_unityBase + g_textSize) ? 1 : 0;
-}
 
-static int gzz_make_rwx(void *addr, size_t len) {
-    uintptr_t pg = (uintptr_t)getpagesize();
-    uintptr_t s = (uintptr_t)addr & ~(pg - 1);
-    uintptr_t e = ((uintptr_t)addr + len + pg - 1) & ~(pg - 1);
-    kern_return_t kr = vm_protect(mach_task_self(), (vm_address_t)s,
-                                  (vm_size_t)(e - s), false,
-                                  VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE);
-    if (kr != KERN_SUCCESS) { L("vm_protect FAIL %p len=%zu kr=%d", addr, len, kr); return 0; }
-    return 1;
-}
-
-// ───────────────────────── ARM64 inline hook ─────────────────────────
-// 16 字节补丁:  ldr x16, #8 ; br x16 ; .quad target
-// trampoline :  原 4 条指令 + 同样 16 字节跳回 target+16
-static int gzz_is_pcrel(uint32_t ins) {
-    uint32_t top = ins >> 26;
-    if (top == 0x05 || top == 0x25) return 1;             // b / bl
-    uint32_t g6 = (ins >> 24) & 0x3F;
-    if (g6 == 0x54) return 1;                             // b.cond
-    if (g6 == 0x34 || g6 == 0x35) return 1;               // cbz / cbnz
-    if (g6 == 0x36 || g6 == 0x37) return 1;               // tbz / tbnz
-    if (g6 == 0x10 || g6 == 0x90) return 1;               // adr / adrp
-    if (g6 == 0x18 || g6 == 0x58 || g6 == 0x98) return 1; // ldr literal
-    return 0;
-}
-
-static int gzz_hook(void *target, void *replacement, void **orig_out, const char *tag) {
-    if (!target || !replacement) return 0;
-    if (!gzz_make_rwx(target, 16)) return 0;
-    uint32_t *src = (uint32_t *)target;
-    for (int i = 0; i < 4; i++) {
-        if (src[i] == 0xD65F03C0) { L("hook[%s] SKIP: ret@insn%d", tag, i); return 0; }
-        if (gzz_is_pcrel(src[i])) { L("hook[%s] SKIP: pc-rel@%d (0x%08x)", tag, i, src[i]); return 0; }
-    }
-    uint32_t *tr = (uint32_t *)mmap(NULL, 4096, PROT_READ | PROT_WRITE | PROT_EXEC,
-                                    MAP_PRIVATE | MAP_ANON, -1, 0);
-    if (tr == MAP_FAILED) { L("hook[%s] mmap FAIL", tag); return 0; }
-    for (int i = 0; i < 4; i++) tr[i] = src[i];
-    tr[4] = 0x58000050;  tr[5] = 0xD61F0200;
-    *(uint64_t *)&tr[6] = (uint64_t)target + 16;
-    sys_icache_invalidate(tr, 64);
-
-    uint32_t patch[4] = { 0x58000050, 0xD61F0200, 0, 0 };
-    *(uint64_t *)&patch[2] = (uint64_t)replacement;
-    memcpy(src, patch, 16);
-    sys_icache_invalidate(target, 16);
-    if (orig_out) *orig_out = (void *)tr;
-    L("hook[%s] OK target=%p repl=%p tramp=%p", tag, target, replacement, tr);
-    return 1;
-}
-
-// ───────────────────────── il2cpp C API (dlsym) ─────────────────────────
-typedef void Il2CppDomain, Il2CppImage, Il2CppClass, Il2CppObject, Il2CppFieldInfo;
+// ───────────────────────── il2cpp C API ─────────────────────────
+typedef void Il2CppDomain, Il2CppImage, Il2CppClass, Il2CppObject, Il2CppException;
 typedef struct { void *methodPointer; } GzzMethodInfo;
 
 typedef struct {
@@ -182,41 +124,38 @@ typedef struct {
     int                (*method_get_param_count)(GzzMethodInfo*);
     void*              (*method_get_param)(GzzMethodInfo*, unsigned);
     void*              (*method_get_return_type)(GzzMethodInfo*);
-    void*              (*method_get_declaring_type)(GzzMethodInfo*);
     int                (*type_get_type)(void*);
     const char*        (*type_get_name)(void*);
-    const char*        (*image_get_name_)(void*);
+    const char*        (*image_get_name)(void*);
     size_t             (*image_get_class_count)(void*);
     Il2CppClass*       (*image_get_class)(void*, size_t);
     void*              (*thread_attach)(Il2CppDomain*);
     void*              (*thread_current)(void);
-    Il2CppObject*      (*runtime_invoke)(GzzMethodInfo*, void*, void**, void**);
+    Il2CppObject*      (*runtime_invoke)(GzzMethodInfo*, void*, void**, Il2CppException**);
     uint32_t           (*array_length)(Il2CppObject*);
-    Il2CppClass*       (*object_get_class)(Il2CppObject*);
-    Il2CppFieldInfo*   (*class_get_field_from_name)(Il2CppClass*, const char*);
-    size_t             (*field_get_offset)(Il2CppFieldInfo*);
     Il2CppObject*      (*type_get_object)(const void*);
     void*              (*class_get_type)(Il2CppClass*);
-    void*              (*field_get_type)(Il2CppFieldInfo*);
-    int                (*class_instance_size)(Il2CppClass*);
-    Il2CppClass*       (*class_get_parent)(Il2CppClass*);
-    void               (*field_static_get_value)(Il2CppFieldInfo*, void*);
-    void               (*field_static_set_value)(Il2CppFieldInfo*, void*);
-    void               (*field_get_value)(Il2CppObject*, Il2CppFieldInfo*, void*);
-    void               (*field_set_value)(Il2CppObject*, Il2CppFieldInfo*, void*);
+    Il2CppClass*       (*object_get_class)(Il2CppObject*);
 } GzzApi;
 
 static GzzApi A;
 static BOOL g_apiReady = NO;
 
-// 手动声明（避免 dlsym 名字错）
+// 前向声明 (gzz_find_objects 需要)
+static GzzMethodInfo *mi_findObjType  = NULL;
+static GzzMethodInfo *mi_setTimeScale = NULL;
+static GzzMethodInfo *mi_fjDamage     = NULL;
+static GzzMethodInfo *mi_fjCrash      = NULL;
+static GzzMethodInfo *mi_bpTiaoGuo    = NULL;
+static int            mi_fjDamage_pt  = -1;
+static Il2CppClass   *k_fjEnemy = NULL, *k_bp = NULL;
+
 static void *GZ(const char *n) {
     void *p = dlsym(RTLD_DEFAULT, n);
     if (!p) { char b[128]; snprintf(b, sizeof(b), "_%s", n); p = dlsym(RTLD_DEFAULT, b); }
     return p;
 }
 
-static BOOL gzz_thread_ok = NO;
 static BOOL gzz_api_init(void) {
     if (g_apiReady) return YES;
     if (!g_unityBase) gzz_find_base();
@@ -233,53 +172,40 @@ static BOOL gzz_api_init(void) {
     A.method_get_param_count  = (void*)GZ("il2cpp_method_get_param_count");
     A.method_get_param        = (void*)GZ("il2cpp_method_get_param");
     A.method_get_return_type  = (void*)GZ("il2cpp_method_get_return_type");
-    A.method_get_declaring_type = (void*)GZ("il2cpp_method_get_declaring_type");
     A.type_get_type           = (void*)GZ("il2cpp_type_get_type");
     A.type_get_name           = (void*)GZ("il2cpp_type_get_name");
-    A.image_get_name_         = (void*)GZ("il2cpp_image_get_name");
+    A.image_get_name          = (void*)GZ("il2cpp_image_get_name");
     A.image_get_class_count   = (void*)GZ("il2cpp_image_get_class_count");
     A.image_get_class         = (void*)GZ("il2cpp_image_get_class");
     A.thread_attach           = (void*)GZ("il2cpp_thread_attach");
     A.thread_current          = (void*)GZ("il2cpp_thread_current");
     A.runtime_invoke          = (void*)GZ("il2cpp_runtime_invoke");
     A.array_length            = (void*)GZ("il2cpp_array_length");
-    A.object_get_class        = (void*)GZ("il2cpp_object_get_class");
-    A.class_get_field_from_name = (void*)GZ("il2cpp_class_get_field_from_name");
-    A.field_get_offset        = (void*)GZ("il2cpp_field_get_offset");
     A.type_get_object         = (void*)GZ("il2cpp_type_get_object");
     A.class_get_type          = (void*)GZ("il2cpp_class_get_type");
-    A.field_get_type          = (void*)GZ("il2cpp_field_get_type");
-    A.class_instance_size     = (void*)GZ("il2cpp_class_instance_size");
-    A.class_get_parent        = (void*)GZ("il2cpp_class_get_parent");
-    A.field_static_get_value  = (void*)GZ("il2cpp_field_static_get_value");
-    A.field_static_set_value  = (void*)GZ("il2cpp_field_static_set_value");
-    A.field_get_value         = (void*)GZ("il2cpp_field_get_value");
-    A.field_set_value         = (void*)GZ("il2cpp_field_set_value");
+    A.object_get_class        = (void*)GZ("il2cpp_object_get_class");
     if (!A.domain_get || !A.domain_get_assemblies || !A.assembly_get_image ||
-        !A.class_from_name || !A.class_get_method_from_name ||
-        !A.method_get_name || !A.method_get_param_count) {
-        L("api: ✗ 必需符号缺失 (domain_get=%p class_from_name=%p)",
-          A.domain_get, A.class_from_name);
+        !A.class_from_name || !A.class_get_methods || !A.method_get_name ||
+        !A.method_get_param_count || !A.runtime_invoke) {
+        L("api: 必需符号缺失 (domain=%p invoke=%p)", A.domain_get, A.runtime_invoke);
         return NO;
     }
-    // 主线程通常已被 Unity attach; 若未 attach 会导致 il2cpp 调用崩溃 → 先补一次
-    if (A.thread_current && A.thread_attach) {
-        if (!A.thread_current()) { A.thread_attach(A.domain_get()); L("api: 已 attach 当前线程"); }
-        gzz_thread_ok = YES;
+    if (A.thread_current && A.thread_attach && !A.thread_current()) {
+        A.thread_attach(A.domain_get());
+        L("api: 已 attach 主线程");
     }
     g_apiReady = YES;
-    L("api ✓ il2cpp C API 就绪 (domain_get=%p thread=%d)", A.domain_get, (int)gzz_thread_ok);
+    L("api: il2cpp C API 就绪 (domain=%p invoke=%p)", A.domain_get, A.runtime_invoke);
     return YES;
 }
 
-// ───────────────────────── 程序集 / 类 / 方法 解析 ─────────────────────────
-#define GZZ_MAX_IMG 128
+// ───────────────────────── 程序集 / 类 / 方法 ─────────────────────────
+#define GZZ_MAX_IMG 16
 static Il2CppImage *g_img[GZZ_MAX_IMG];
 static char         g_imgName[GZZ_MAX_IMG][96];
 static int          g_nImg = 0;
 
-// ⚠️ 必须用精确名匹配: "Assembly-CSharp-firstpass" 也包含子串 "Assembly-CSharp",
-//    用 strstr 会错拿 firstpass 镜像 (里面没有游戏类)。
+// ⚠️ 必须精确比对: "Assembly-CSharp-firstpass.dll" 含子串 "Assembly-CSharp"
 static int gzz_load_images(void) {
     if (g_nImg) return g_nImg;
     Il2CppDomain *dom = A.domain_get();
@@ -287,20 +213,18 @@ static int gzz_load_images(void) {
     size_t cnt = 0;
     void **asms = A.domain_get_assemblies(dom, &cnt);
     if (!asms) return 0;
-    L("img: 域内程序集 %zu 个", cnt);
     for (size_t i = 0; i < cnt && g_nImg < GZZ_MAX_IMG; i++) {
         Il2CppImage *im = A.assembly_get_image(asms[i]);
         if (!im) continue;
-        const char *nm = A.image_get_name_ ? A.image_get_name_(im) : NULL;
+        const char *nm = A.image_get_name ? A.image_get_name(im) : NULL;
         if (!nm) continue;
-        if (strcmp(nm, "Assembly-CSharp.dll") && strcmp(nm, "UnityEngine.CoreModule.dll") &&
-            strcmp(nm, "mscorlib.dll") && strcmp(nm, "UnityEngine.dll")) continue;
+        if (strcmp(nm, "Assembly-CSharp.dll") && strcmp(nm, "UnityEngine.CoreModule.dll"))
+            continue;
         g_img[g_nImg] = im;
         snprintf(g_imgName[g_nImg], sizeof(g_imgName[0]), "%s", nm);
         L("img[%d] %s", g_nImg, nm);
         g_nImg++;
     }
-    if (!g_nImg) L("img: ✗ 未找到需要的程序集");
     return g_nImg;
 }
 
@@ -310,31 +234,17 @@ static Il2CppImage *gzz_image_named(const char *suffix) {
     return NULL;
 }
 
-// 按 名称+参数个数 精确找方法 (遍历, 避免同名不同参数歧义)
+// 遍历法精确匹配 (名称 + 参数个数), 避免同名重载拿错
 static GzzMethodInfo *gzz_find_method(Il2CppClass *k, const char *name, int nparams) {
-    if (!k || !name) return NULL;
-    if (A.class_get_methods && A.method_get_name) {
-        void *iter = NULL;
-        GzzMethodInfo *mi;
-        while ((mi = A.class_get_methods(k, &iter)) != NULL) {
-            const char *mn = A.method_get_name(mi);
-            int pc = A.method_get_param_count ? A.method_get_param_count(mi) : -1;
-            if (mn && strcmp(mn, name) == 0 && pc == nparams) return mi;
-        }
-    }
-    if (A.class_get_method_from_name)
-        return A.class_get_method_from_name(k, name, nparams);
-    return NULL;
-}
-
-static GzzMethodInfo *gzz_find_method_any(Il2CppClass *k, const char *name) {
     if (!k || !name || !A.class_get_methods) return NULL;
     void *iter = NULL;
     GzzMethodInfo *mi;
     while ((mi = A.class_get_methods(k, &iter)) != NULL) {
         const char *mn = A.method_get_name(mi);
-        if (mn && strcmp(mn, name) == 0) return mi;
+        int pc = A.method_get_param_count ? A.method_get_param_count(mi) : -1;
+        if (mn && strcmp(mn, name) == 0 && pc == nparams) return mi;
     }
+    if (A.class_get_method_from_name) return A.class_get_method_from_name(k, name, nparams);
     return NULL;
 }
 
@@ -346,100 +256,30 @@ static Il2CppClass *gzz_class(const char *imgSuffix, const char *ns, const char 
     return k;
 }
 
-// 记录方法签名到扫描文件
-static void gzz_sig_line(FILE *f, const char *cls, const char *mname, GzzMethodInfo *mi) {
-    if (!mi || !f) return;
-    const char *rt = "?";
-    if (A.method_get_return_type && A.type_get_name) {
-        void *rtp = A.method_get_return_type(mi);
-        if (rtp) { const char *s = A.type_get_name(rtp); if (s) rt = s; }
+// 统一 invoke 包装: 检查 C# 异常, 避免异常对象被静默丢弃导致的状态错乱
+static Il2CppObject *gzz_invoke(GzzMethodInfo *mi, void *self, void **args, const char *tag) {
+    if (!mi || !mi->methodPointer || !A.runtime_invoke) return NULL;
+    Il2CppException *exc = NULL;
+    Il2CppObject *r = A.runtime_invoke(mi, self, args, &exc);
+    if (exc) {
+        g_nExc++;
+        if (g_nExc <= 5) L("invoke[%s]: ⚠️ C# 异常 (第 %d 次)", tag, g_nExc);
+        return NULL;
     }
-    char pb[512] = {0};
-    int pc = A.method_get_param_count ? A.method_get_param_count(mi) : 0;
-    for (int i = 0; i < pc && i < 8; i++) {
-        const char *pn = "?";
-        void *pt = A.method_get_param ? A.method_get_param(mi, i) : NULL;
-        if (pt && A.type_get_name) { const char *s = A.type_get_name(pt); if (s) pn = s; }
-        strncat(pb, pn, sizeof(pb) - strlen(pb) - 2);
-        if (i + 1 < pc) strncat(pb, ", ", sizeof(pb) - strlen(pb) - 2);
-    }
-    fprintf(f, "%s::%s(%s) -> %s   ptr=%p\n", cls, mname, pb, rt,
-            mi->methodPointer);
+    return r;
 }
 
-// ───────────────────────── 加速: 直接用 il2cpp 调 UnityEngine.Time.set_timeScale ─────────────────────────
-// ⭐ 不 hook, 零 __TEXT 修改 → 无代码签名风险。
-//    每 0.25s 调用一次把 timeScale 钉在倍数上, 覆盖游戏自身的重置。
-static GzzMethodInfo *mi_setTimeScale = NULL;
-static GzzMethodInfo *mi_getTimeScale = NULL;
-
-static void gzz_apply_timescale(void) {
-    if (!mi_setTimeScale || !mi_setTimeScale->methodPointer) return;
-    if (!g_speedOn) return;
-    float want = g_speedMul;
-    if (want > 20.0f) want = 20.0f;
-    float v = want;
-    void *args[1] = { &v };
-    A.runtime_invoke(mi_setTimeScale, NULL, args, NULL);
-    g_tsSets++;
-}
-static float gzz_read_timescale(void) {
-    if (!mi_getTimeScale || !mi_getTimeScale->methodPointer) return -1.0f;
-    void *exc = NULL;
-    Il2CppObject *r = A.runtime_invoke(mi_getTimeScale, NULL, NULL, &exc);
-    if (!r) return -1.0f;
-    // 静态返回的 float 被装箱; 解箱取前 4 字节 (il2cpp 值类型对象头后紧跟数据)
-    return *(float *)((char *)r + sizeof(void *) * 2);
-}
-
-// ───────────────────────── 秒杀: 运行时类遍历 + runtime_invoke ─────────────────────────
-// 思路: 不依赖硬编码字段偏移 —— 用运行时类查找 + 真实业务方法调用.
-//   FindObjectsOfType(Type) 由 UnityEngine.Object 提供, 返回场景内该类全部实例.
-//   ⚠️ 只能找 "活的 UnityEngine.Object"; 纯数据类 (BattleModel/BattleHero) 找不到.
-static GzzMethodInfo *mi_findObjType   = NULL;   // UnityEngine.Object::FindObjectsOfType(Type)
-static GzzMethodInfo *mi_fjDamage      = NULL;
-static GzzMethodInfo *mi_fjCrash       = NULL;
-static GzzMethodInfo *mi_mhcDead       = NULL;
-static GzzMethodInfo *mi_bhcDead       = NULL;
-static GzzMethodInfo *mi_bhcChangeHp   = NULL;
-static GzzMethodInfo *mi_bp_TiaoGuo    = NULL;
-static GzzMethodInfo *mi_bm_UpdateResult = NULL;
-static int            mi_fjDamage_pt   = -1;     // 形参 il2cpp 类型码
-static int            mi_bhcChgHp_pt   = -1;
-
-static Il2CppClass *k_fjEnemy = NULL, *k_mhc = NULL, *k_bhc = NULL, *k_bp = NULL, *k_bm = NULL;
-
-// 运行时解析的字段偏移 (避免硬编码)
-static int g_bhcCampOff  = -1;  // BattleHeroCell.meCamp  (int)
-static int g_bhcNowHp    = -1;  // BattleHeroCell.nowHp   (long)
-static int g_bhcMaxHp    = -1;  // BattleHeroCell.maxHp   (long)
-static int g_bhcHp       = -1;  // BattleHeroCell.hp      (long)
-static int g_bpTimeScale = -1;  // BattlePanel._timeScale (float)
-static int g_bhcInstSize = 0;   // BattleHeroCell 实例大小 (越界写保护)
-
-static const char *gzz_obj_classname(Il2CppObject *o) {
-    if (!o || !A.object_get_class || !A.class_get_name) return "?";
-    Il2CppClass *k = A.object_get_class(o);
-    return k ? A.class_get_name(k) : "?";
-}
-
-// 场景内指定类的全部实例
+// 场景内指定类的全部实例 (FindObjectsOfType(Type)); 元素起始偏移 32
 static int gzz_find_objects(Il2CppClass *k, Il2CppObject **out, int max) {
-    if (!k || !mi_findObjType || !mi_findObjType->methodPointer) return 0;
-    if (!A.type_get_object || !A.class_get_type) return 0;
+    if (!k || !A.type_get_object || !A.class_get_type) return 0;
     Il2CppObject *typeObj = A.type_get_object(A.class_get_type(k));
     if (!typeObj) return 0;
     void *args[1] = { typeObj };
-    Il2CppObject *arr = A.runtime_invoke(mi_findObjType, NULL, args, NULL);
+    Il2CppObject *arr = gzz_invoke(mi_findObjType, NULL, args, "FindObjectsOfType");
     if (!arr) return 0;
-    // Il2CppArray 布局: obj(16B: klass+monitor) | bounds(8B) | max_length(4B+4B pad)
-    //                    | vector[] @ 偏移 32
-    size_t n = 0;
-    if (A.array_length) {
-        n = (size_t)A.array_length(arr);
-    } else {
-        n = (size_t)*(uint32_t *)((char *)arr + 24);
-    }
+    // Il2CppArray: obj(16B) | bounds(8B) | max_length(4B+4B pad) | vector[] @32
+    size_t n = A.array_length ? (size_t)A.array_length(arr)
+                              : (size_t)*(uint32_t *)((char *)arr + 24);
     Il2CppObject **elems = (Il2CppObject **)((char *)arr + 32);
     int c = 0;
     for (size_t i = 0; i < n && c < max; i++)
@@ -447,392 +287,203 @@ static int gzz_find_objects(Il2CppClass *k, Il2CppObject **out, int max) {
     return c;
 }
 
-static int gzz_boost_panel(void);
-static void gzz_kill_pass(void);
+// ───────────────────────── 目标解析 ─────────────────────────
+static int g_tgtDone = 0;
+#define GZZ_NTGT 6
 
-static volatile int g_lastKillN = 0;
-static volatile int g_lastSkipN = 0;
-static volatile int g_lastWinF   = 0;
-
-// ① 飞机大战 / 探索类敌人: 喂巨额伤害 (客户端模拟, 确定性生效)
-static int gzz_kill_enemies(void) {
-    static Il2CppObject *buf[512];
-    int total = 0;
-    if (k_fjEnemy) {
-        int n = gzz_find_objects(k_fjEnemy, buf, 512);
-        for (int i = 0; i < n; i++) {
-            if (mi_fjDamage && mi_fjDamage->methodPointer) {
-                if (mi_fjDamage_pt == 13) { float f = 9.9e8f;      void *a[1] = { &f };
-                                            A.runtime_invoke(mi_fjDamage, buf[i], a, NULL); }
-                else                      { int32_t v = 999999999; void *a[1] = { &v };
-                                            A.runtime_invoke(mi_fjDamage, buf[i], a, NULL); }
-                total++;
-            } else if (mi_fjCrash && mi_fjCrash->methodPointer) {
-                A.runtime_invoke(mi_fjCrash, buf[i], NULL, NULL);
-                total++;
+static void gzz_resolve_step(void) {
+    if (g_tgtDone >= GZZ_NTGT) return;
+    int step = g_tgtDone++;
+    switch (step) {
+        case 0: {
+            k_fjEnemy = gzz_class("Assembly-CSharp", "JiuShiZhu", "FeiJiEnemy");
+            k_bp      = gzz_class("Assembly-CSharp", "JiuShiZhu", "BattlePanel");
+            L("cache: FeiJiEnemy=%p BattlePanel=%p", k_fjEnemy, k_bp);
+            break;
+        }
+        case 1: {
+            Il2CppClass *k = gzz_class("UnityEngine.CoreModule", "UnityEngine", "Object");
+            mi_findObjType = k ? gzz_find_method(k, "FindObjectsOfType", 1) : NULL;
+            L("tgt: FindObjectsOfType=%p", mi_findObjType ? mi_findObjType->methodPointer : NULL);
+            break;
+        }
+        case 2: {
+            Il2CppClass *k = gzz_class("UnityEngine.CoreModule", "UnityEngine", "Time");
+            mi_setTimeScale = k ? gzz_find_method(k, "set_timeScale", 1) : NULL;
+            L("tgt: Time.set_timeScale=%p", mi_setTimeScale ? mi_setTimeScale->methodPointer : NULL);
+            break;
+        }
+        case 3: {
+            mi_fjDamage = k_fjEnemy ? gzz_find_method(k_fjEnemy, "Damage", 1) : NULL;
+            if (mi_fjDamage && A.method_get_param && A.type_get_type) {
+                void *pt = A.method_get_param(mi_fjDamage, 0);
+                if (pt) mi_fjDamage_pt = A.type_get_type(pt);
             }
+            L("tgt: FeiJiEnemy.Damage=%p paramType=%d",
+              mi_fjDamage ? mi_fjDamage->methodPointer : NULL, mi_fjDamage_pt);
+            break;
         }
-        g_nDamage += total;
-    }
-    if (k_mhc && mi_mhcDead && mi_mhcDead->methodPointer) {
-        int n = gzz_find_objects(k_mhc, buf, 512);
-        for (int i = 0; i < n; i++) A.runtime_invoke(mi_mhcDead, buf[i], NULL, NULL);
-        if (n) g_nMapAtk += n;
-    }
-    return total;
-}
-
-// ② 回合战斗: 找到活着的 BattlePanel, 调 TiaoGuo() 立即结算
-//    每个实例只跳一次, 确保任何新开的战斗都被秒跳
-#define GZZ_SEEN_MAX 64
-#define GZZ_SEEN_TTL 30        // 秒; 超过则视为新战斗, 允许重跳
-static Il2CppObject *g_seenPtr[GZZ_SEEN_MAX];
-static int            g_seenAge[GZZ_SEEN_MAX];
-static int            g_seenN = 0;
-
-static int gzz_autoskip(void) {
-    static Il2CppObject *buf[64];
-    if (!k_bp || !mi_bp_TiaoGuo || !mi_bp_TiaoGuo->methodPointer) return 0;
-    for (int j = 0; j < g_seenN; j++) g_seenAge[j]++;
-    int n = gzz_find_objects(k_bp, buf, 64);
-    int did = 0;
-    for (int i = 0; i < n; i++) {
-        int slot = -1;
-        for (int j = 0; j < g_seenN; j++) {
-            if (g_seenPtr[j] == buf[i]) { slot = j; break; }
+        case 4: {
+            mi_fjCrash = k_fjEnemy ? gzz_find_method(k_fjEnemy, "Crash", 0) : NULL;
+            L("tgt: FeiJiEnemy.Crash=%p", mi_fjCrash ? mi_fjCrash->methodPointer : NULL);
+            break;
         }
-        if (slot >= 0 && g_seenAge[slot] < GZZ_SEEN_TTL * 2) continue;   // 2Hz → 30s
-        if (slot >= 0) { g_seenAge[slot] = 0; }
-        else if (g_seenN < GZZ_SEEN_MAX) { g_seenPtr[g_seenN] = buf[i]; g_seenAge[g_seenN] = 0; g_seenN++; }
-        else { for (int j = 0; j < GZZ_SEEN_MAX / 2; j++) { g_seenPtr[j] = g_seenPtr[j + GZZ_SEEN_MAX / 2]; g_seenAge[j] = g_seenAge[j + GZZ_SEEN_MAX / 2]; } g_seenN = GZZ_SEEN_MAX / 2;
-               g_seenPtr[g_seenN] = buf[i]; g_seenAge[g_seenN] = 0; g_seenN++; }
-        A.runtime_invoke(mi_bp_TiaoGuo, buf[i], NULL, NULL);
-        did++;
-        L("kill: 自动跳过战斗 (BattlePanel=%p, 场景内 %d 个, 累计 %ld)", buf[i], n, (long)(g_nSkip + 1));
+        case 5: {
+            mi_bpTiaoGuo = k_bp ? gzz_find_method(k_bp, "TiaoGuo", 0) : NULL;
+            L("tgt: BattlePanel.TiaoGuo=%p", mi_bpTiaoGuo ? mi_bpTiaoGuo->methodPointer : NULL);
+            L("tgt: 解析完成 (FeiJiEnemy=%d Damage=%d TiaoGuo=%d)",
+              k_fjEnemy != NULL, mi_fjDamage != NULL, mi_bpTiaoGuo != NULL);
+            break;
+        }
     }
-    if (did) g_nSkip += did;
-    return did;
 }
 
-// ③ 强制胜利 (默认关闭, 真机验证后再开)
-//    ⚠️【推测，人工验证】BattleModel::UpdateResult(int) 的形参疑为 winCamp;
-//       若如此, 传入我方阵营即可让客户端判定胜利。
-//       服务端若二次校验则不生效, 且联机模式有封号风险 → 默认关。
-static int gzz_force_win(void) {
-    static Il2CppObject *buf[32];
-    static Il2CppObject *seen[64];
-    static int seenN = 0;
-    if (!k_bm || !mi_bm_UpdateResult || !mi_bm_UpdateResult->methodPointer) return 0;
-    if (g_myCamp < 0) return 0;
-    int n = gzz_find_objects(k_bm, buf, 32);
-    int did = 0;
-    for (int i = 0; i < n; i++) {
-        int known = 0;
-        for (int j = 0; j < seenN; j++) if (seen[j] == buf[i]) { known = 1; break; }
-        if (known) continue;
-        if (seenN < 64) seen[seenN++] = buf[i];
-        else { for (int j = 0; j < 32; j++) seen[j] = seen[j + 32]; seenN = 32; }
-        int32_t camp = g_myCamp;
-        void *a[1] = { &camp };
-        A.runtime_invoke(mi_bm_UpdateResult, buf[i], a, NULL);
-        did++;
-        L("kill: 强制胜利 UpdateResult(camp=%d) on %p", g_myCamp, buf[i]);
-    }
-    if (did) g_lastWinF += did;
-    return did;
+// ───────────────────────── 加速: 只走 UnityEngine.Time.set_timeScale ─────────────────────────
+static void gzz_apply_timescale(void) {
+    if (!mi_setTimeScale) return;
+    float v = g_speedMul > 20.0f ? 20.0f : g_speedMul;
+    void *args[1] = { &v };
+    gzz_invoke(mi_setTimeScale, NULL, args, "Time.set_timeScale");
+    g_nTsSet++;
 }
 
-// ③ 回合战斗单元秒杀: 把敌方 (meCamp != 我方) 的血量直接写 0, 再调 Dead()
-//    ⚠️ 偏移全部来自运行时字段解析; 越界/解析失败时整条路径自动禁用。
-//       若真机日志显示 meCamp=-1, 请贴 gdzz.log 供校准。
-static int gzz_kill_units(void) {
+// ───────────────────────── 秒杀: 只调游戏自己的业务方法 ─────────────────────────
+// ① 飞机大战 / 探索小游戏敌人: FeiJiEnemy::Damage(int) 喂大数 (客户端模拟, 安全)
+static int gzz_kill_enemies(void) {
     static Il2CppObject *buf[256];
-    if (!k_bhc || !mi_bhcDead || !mi_bhcDead->methodPointer) return 0;
-    if (g_myCamp < 0 || g_bhcCampOff < 0) return 0;
-    if (g_bhcNowHp < 0 && g_bhcMaxHp < 0 && g_bhcHp < 0) return 0;
-
-    int n = gzz_find_objects(k_bhc, buf, 256);
     int done = 0;
-    for (int i = 0; i < n; i++) {
-        int camp = *(int *)((char *)buf[i] + g_bhcCampOff);
-        if (camp == g_myCamp) continue;      // 不动我方
-        if (g_bhcNowHp > 0) *(int64_t *)((char *)buf[i] + g_bhcNowHp) = 0;
-        if (g_bhcMaxHp > 0) *(int64_t *)((char *)buf[i] + g_bhcMaxHp) = 0;
-        if (g_bhcHp    > 0) *(int64_t *)((char *)buf[i] + g_bhcHp)    = 0;
-        A.runtime_invoke(mi_bhcDead, buf[i], NULL, NULL);
-        done++;
+    if (k_fjEnemy && mi_fjDamage) {
+        int n = gzz_find_objects(k_fjEnemy, buf, 256);
+        for (int i = 0; i < n; i++) {
+            if (mi_fjDamage_pt == 13) { float f = 9.9e8f;     void *a[1] = { &f };
+                                        gzz_invoke(mi_fjDamage, buf[i], a, "FeiJiEnemy.Damage(f)"); }
+            else                      { int32_t v = 999999999; void *a[1] = { &v };
+                                        gzz_invoke(mi_fjDamage, buf[i], a, "FeiJiEnemy.Damage(i)"); }
+            done++;
+        }
+        g_nDamage += done;
+    } else if (k_fjEnemy && mi_fjCrash) {
+        int n = gzz_find_objects(k_fjEnemy, buf, 256);
+        for (int i = 0; i < n; i++) { gzz_invoke(mi_fjCrash, buf[i], NULL, "FeiJiEnemy.Crash"); done++; }
     }
-    if (done) g_nChangeHp += done;
     return done;
 }
 
-// 一次性诊断: 打印场景内各类实例的真实字段值 (用于校准, 只跑一次)
-static void gzz_probe_once(void) {
-    static int done = 0;
-    if (done) return;
-    static Il2CppObject *buf[64];
-    int total = 0;
+// ② 回合战斗: 调 BattlePanel::TiaoGuo() 立即结算 (游戏自身"跳过"按钮的入口)
+//    用"场景内实例集合"做去重: 集合清空 (战斗结束) 后同一实例可再次触发。
+#define GZZ_SEEN_MAX 32
+static Il2CppObject *g_seen[GZZ_SEEN_MAX];
+static int            g_seenN = 0;
 
-    if (k_bhc) {
-        int n = gzz_find_objects(k_bhc, buf, 64);
-        L("probe: BattleHeroCell 实例 %d 个 (g_myCamp=%d meCampOff=%d nowHpOff=%d maxHpOff=%d hpOff=%d)",
-          n, g_myCamp, g_bhcCampOff, g_bhcNowHp, g_bhcMaxHp, g_bhcHp);
-        for (int i = 0; i < n && i < 8; i++) {
-            int camp = g_bhcCampOff > 0 ? *(int *)((char *)buf[i] + g_bhcCampOff) : -99;
-            int64_t nowHp = g_bhcNowHp > 0 ? *(int64_t *)((char *)buf[i] + g_bhcNowHp) : -1;
-            int64_t maxHp = g_bhcMaxHp > 0 ? *(int64_t *)((char *)buf[i] + g_bhcMaxHp) : -1;
-            L("  bhc[%d]=%p class=%s camp=%d nowHp=%lld maxHp=%lld",
-              i, buf[i], gzz_obj_classname(buf[i]), camp, (long long)nowHp, (long long)maxHp);
-            total++;
-        }
-    }
-    if (k_fjEnemy) {
-        int n = gzz_find_objects(k_fjEnemy, buf, 64);
-        L("probe: FeiJiEnemy 实例 %d 个 (Damage paramType=%d)", n, mi_fjDamage_pt);
-        for (int i = 0; i < n && i < 4; i++)
-            L("  fj[%d]=%p class=%s", i, buf[i], gzz_obj_classname(buf[i]));
-        total += n;
-    }
-    if (k_bp) {
-        int n = gzz_find_objects(k_bp, buf, 32);
-        L("probe: BattlePanel 实例 %d 个 (TiaoGuo=%p _timeScaleOff=%d)",
-          n, mi_bp_TiaoGuo ? mi_bp_TiaoGuo->methodPointer : NULL, g_bpTimeScale);
-        total += n;
-    }
-    if (k_mhc) {
-        int n = gzz_find_objects(k_mhc, buf, 32);
-        L("probe: MapHeroCell 实例 %d 个 (Dead=%p)", n, mi_mhcDead ? mi_mhcDead->methodPointer : NULL);
-        total += n;
-    }
-    if (total > 0) done = 1;
-}
-
-// ④ 加速兜底: 直接写 BattlePanel._timeScale (游戏自带的战斗倍速字段)
-//    ⚠️【推测，人工验证】字段名 _timeScale 来自元数据 (typeIdx 为 float)。
-//       若真机日志显示 off<=0 或改后无效果, 请只用全局 timeScale 那条路径。
-static int gzz_boost_panel(void) {
+static int gzz_autoskip(void) {
     static Il2CppObject *buf[32];
-    if (!k_bp || g_bpTimeScale < 0) return 0;
+    if (!k_bp || !mi_bpTiaoGuo) return 0;
     int n = gzz_find_objects(k_bp, buf, 32);
-    for (int i = 0; i < n; i++)
-        *(float *)((char *)buf[i] + g_bpTimeScale) = g_speedMul;
-    return n;
+    if (n == 0) { g_seenN = 0; return 0; }     // 战斗结束 → 清空去重表
+    int did = 0;
+    for (int i = 0; i < n; i++) {
+        int known = 0;
+        for (int j = 0; j < g_seenN; j++) if (g_seen[j] == buf[i]) { known = 1; break; }
+        if (known) continue;
+        if (g_seenN < GZZ_SEEN_MAX) g_seen[g_seenN++] = buf[i];
+        gzz_invoke(mi_bpTiaoGuo, buf[i], NULL, "BattlePanel.TiaoGuo");
+        did++;
+        L("kill: 自动跳过战斗 (BattlePanel=%p, 场景内 %d 个, 累计 %ld)",
+          buf[i], n, (long)(g_nSkip + 1));
+    }
+    g_nSkip += did;
+    return did;
 }
 
 static void gzz_kill_pass(void) {
     if (!g_killOn) return;
-    g_lastKillN = gzz_kill_enemies() + gzz_kill_units();
-    g_lastSkipN = gzz_autoskip();
-    if (g_forceWin) gzz_force_win();
+    gzz_kill_enemies();
+    gzz_autoskip();
 }
 
-// ───────────────────────── 目标表 ─────────────────────────
-typedef struct {
-    const char *img;      // 程序集后缀
-    const char *ns;
-    const char *cls;
-    const char *mth;
-    int         np;
-    const char *tag;
-    int         kind;
-    int         done;
-} gzz_target_t;
-
-// kind:  9=绑 set_timeScale   10=绑 get_timeScale
-//       20=绑 FindObjectsOfType 21=绑 FeiJiEnemy::Damage  22=绑 Crash
-//       23=绑 MapHeroCell::Dead 24=绑 BattleHeroCell::Dead 25=绑 ChangeHp
-//       30=缓存运行时类 + 解析字段偏移   8=仅记录签名
-static gzz_target_t g_targets[] = {
-  {"UnityEngine.CoreModule", "UnityEngine", "Time", "set_timeScale", 1, "Time.set_timeScale", 9, 0},
-  {"UnityEngine.CoreModule", "UnityEngine", "Time", "get_timeScale", 0, "Time.get_timeScale", 10, 0},
-  {"UnityEngine.CoreModule", "UnityEngine", "Object", "FindObjectsOfType", 1, "Object.FindObjectsOfType", 20, 0},
-  {"Assembly-CSharp", "JiuShiZhu", "FeiJiEnemy",     "Damage",   1, "FeiJiEnemy.Damage",    21, 0},
-  {"Assembly-CSharp", "JiuShiZhu", "FeiJiEnemy",     "Crash",    0, "FeiJiEnemy.Crash",     22, 0},
-  {"Assembly-CSharp", "JiuShiZhu", "MapHeroCell",    "Dead",     0, "MapHeroCell.Dead",     23, 0},
-  {"Assembly-CSharp", "JiuShiZhu", "BattleHeroCell", "Dead",     0, "BattleHeroCell.Dead",  24, 0},
-  {"Assembly-CSharp", "JiuShiZhu", "BattleHeroCell", "ChangeHp", 1, "BattleHeroCell.ChangeHp", 25, 0},
-  {"Assembly-CSharp", "JiuShiZhu", "@CACHE",         "@CAMP",    0, "cache.classes",        30, 0},
-  // 仅记录签名 (用于真机核对)
-  {"Assembly-CSharp", "JiuShiZhu", "BattlePanel",    "TiaoGuo",  0, "BattlePanel.TiaoGuo", 26, 0},
-  {"Assembly-CSharp", "JiuShiZhu", "BattlePanel",    "RunLogic", 1, "BattlePanel.RunLogic", 8, 0},
-  {"Assembly-CSharp", "JiuShiZhu", "FeiJiBattleMap", "UpdateMapX", 1, "FeiJiBattleMap.UpdateMapX", 8, 0},
-  {"Assembly-CSharp", "JiuShiZhu", "BattlePanel2",   "ChangeHp", 1, "BattlePanel2.ChangeHp", 8, 0},
-  {"Assembly-CSharp", "JiuShiZhu", "UIDataModel",    "GetNowBattleSpeed", 0, "UIDataModel.GetNowBattleSpeed", 8, 0},
-  {"Assembly-CSharp", "JiuShiZhu", "BattleModel",    "UpdateResult", 1, "BattleModel.UpdateResult", 27, 0},
-  {"Assembly-CSharp", "JiuShiZhu", "BattleModel",    "@CAMP",       0, "BattleModel.camp", 31, 0},
-};
-#define GZZ_NTGT ((int)(sizeof(g_targets) / sizeof(g_targets[0])))
-
-static int   g_tgtDone = 0;
-static FILE *g_scanF   = NULL;
-
-static void gzz_scan_open(void) {
-    if (g_scanF) return;
-    NSString *d = gzz_doc();
-    if (!d) return;
-    NSString *p = [d stringByAppendingPathComponent:@"gdzz_scan.txt"];
-    g_scanF = fopen(p.fileSystemRepresentation, "a");
-    if (g_scanF) fprintf(g_scanF, "\n==== scan %s ====\n", [[NSDate date] description].UTF8String);
-}
-
-static int gzz_param_type(GzzMethodInfo *mi, int idx) {
-    if (!mi || !A.method_get_param || !A.type_get_type) return -1;
-    void *pt = A.method_get_param(mi, (unsigned)idx);
-    if (!pt) return -1;
-    return A.type_get_type(pt);
-}
-
-// 运行时解析关键字段偏移
-static int gzz_field_off(Il2CppClass *k, const char *name) {
-    if (!k || !name || !A.class_get_field_from_name || !A.field_get_offset) return -1;
-    Il2CppFieldInfo *f = A.class_get_field_from_name(k, name);
-    if (!f) return -1;
-    return (int)A.field_get_offset(f);
-}
-static void gzz_resolve_fields(void) {
-    if (k_bhc) {
-        g_bhcCampOff = gzz_field_off(k_bhc, "meCamp");
-        g_bhcNowHp   = gzz_field_off(k_bhc, "nowHp");
-        g_bhcMaxHp   = gzz_field_off(k_bhc, "maxHp");
-        g_bhcHp      = gzz_field_off(k_bhc, "hp");
-        if (A.class_instance_size) g_bhcInstSize = (int)A.class_instance_size(k_bhc);
-    }
-    if (k_bp) g_bpTimeScale = gzz_field_off(k_bp, "_timeScale");
-    // 越界保护: 字段偏移必须落在实例内且非负
-    int sz = g_bhcInstSize > 0 ? g_bhcInstSize : 2048;
-    if (g_bhcCampOff < 0 || g_bhcCampOff + 4  > sz) g_bhcCampOff = -1;
-    if (g_bhcNowHp   < 0 || g_bhcNowHp   + 8  > sz) g_bhcNowHp   = -1;
-    if (g_bhcMaxHp   < 0 || g_bhcMaxHp   + 8  > sz) g_bhcMaxHp   = -1;
-    if (g_bhcHp      < 0 || g_bhcHp      + 8  > sz) g_bhcHp      = -1;
-    L("cache: bhc instSize=%d meCamp=%d nowHp=%d maxHp=%d hp=%d | bp._timeScale=%d",
-      g_bhcInstSize, g_bhcCampOff, g_bhcNowHp, g_bhcMaxHp, g_bhcHp, g_bpTimeScale);
-}
-
-// 每 tick 解析 1 个目标 (主线程分步 → 避免 Assembly 惰性初始化竞态)
-static void gzz_resolve_step(void) {
-    if (g_tgtDone >= GZZ_NTGT) return;
-    gzz_target_t *t = &g_targets[g_tgtDone];
-    gzz_scan_open();
-
-    if (t->kind == 31) {         // 读 BattleModel 静态阵营常量
-        k_bm = gzz_class("Assembly-CSharp", "JiuShiZhu", "BattleModel");
-        int a = -1, b = -1;
-        if (k_bm && A.class_get_field_from_name && A.field_static_get_value) {
-            Il2CppFieldInfo *fa = A.class_get_field_from_name(k_bm, "CAMP_ATTACK_ROLE");
-            Il2CppFieldInfo *fb = A.class_get_field_from_name(k_bm, "CAMP_DEFENCE_ROLE");
-            if (fa) A.field_static_get_value(fa, &a);
-            if (fb) A.field_static_get_value(fb, &b);
+// ───────────────────────── 一次性探针 (诊断, 不修改任何内存) ─────────────────────────
+static void gzz_probe(void) {
+    static int logged = 0;
+    static Il2CppObject *buf[64];
+    if (logged) return;
+    if (k_fjEnemy) {
+        int n = gzz_find_objects(k_fjEnemy, buf, 64);
+        if (n) {
+            L("probe: FeiJiEnemy %d 个 (Damage paramType=%d)", n, mi_fjDamage_pt);
+            logged = 1;
         }
-        g_myCamp = (a >= 0) ? a : 1;   // 挑战方视为我方; 读不到时回退 1
-        L("cache: BattleModel=%p CAMP_ATTACK_ROLE=%d CAMP_DEFENCE_ROLE=%d → g_myCamp=%d",
-          k_bm, a, b, g_myCamp);
-        t->done = 1; g_tgtDone++; return;
     }
-
-    if (t->kind == 30) {         // 缓存类 + 字段偏移
-        k_fjEnemy = gzz_class("Assembly-CSharp", "JiuShiZhu", "FeiJiEnemy");
-        k_mhc     = gzz_class("Assembly-CSharp", "JiuShiZhu", "MapHeroCell");
-        k_bhc     = gzz_class("Assembly-CSharp", "JiuShiZhu", "BattleHeroCell");
-        k_bp      = gzz_class("Assembly-CSharp", "JiuShiZhu", "BattlePanel");
-        L("cache: FeiJiEnemy=%p MapHeroCell=%p BattleHeroCell=%p BattlePanel=%p",
-          k_fjEnemy, k_mhc, k_bhc, k_bp);
-        gzz_resolve_fields();
-        t->done = 1; g_tgtDone++; return;
+    if (!logged && k_bp) {
+        int n = gzz_find_objects(k_bp, buf, 32);
+        if (n) { L("probe: BattlePanel %d 个 (TiaoGuo=%p)", n,
+                   mi_bpTiaoGuo ? mi_bpTiaoGuo->methodPointer : NULL); logged = 1; }
     }
-
-    Il2CppClass *k = gzz_class(t->img, t->ns, t->cls);
-    if (!k) {
-        L("tgt[%s] ✗ 类未找到", t->tag);
-        if (g_scanF) fprintf(g_scanF, "MISS-CLASS %s\n", t->tag);
-        t->done = -1; g_tgtDone++; return;
-    }
-    GzzMethodInfo *mi = gzz_find_method(k, t->mth, t->np);
-    if (!mi) mi = gzz_find_method_any(k, t->mth);
-    if (!mi || !mi->methodPointer) {
-        L("tgt[%s] ✗ 方法未找到", t->tag);
-        if (g_scanF) fprintf(g_scanF, "MISS-METHOD %s\n", t->tag);
-        t->done = -1; g_tgtDone++; return;
-    }
-    if (g_scanF) { gzz_sig_line(g_scanF, t->tag, t->mth, mi); fflush(g_scanF); }
-
-    switch (t->kind) {
-        case 9:  mi_setTimeScale = mi; L("tgt[%s] ✓ 绑定 %p", t->tag, mi->methodPointer); break;
-        case 10: mi_getTimeScale = mi; L("tgt[%s] ✓ 绑定 %p", t->tag, mi->methodPointer); break;
-        case 20: mi_findObjType = mi;  L("tgt[%s] ✓ 绑定 %p", t->tag, mi->methodPointer); break;
-        case 21: mi_fjDamage = mi; mi_fjDamage_pt = gzz_param_type(mi, 0);
-                 L("tgt[%s] ✓ 绑定 %p paramType=%d", t->tag, mi->methodPointer, mi_fjDamage_pt); break;
-        case 22: mi_fjCrash = mi;      L("tgt[%s] ✓ 绑定 %p", t->tag, mi->methodPointer); break;
-        case 23: mi_mhcDead = mi;      L("tgt[%s] ✓ 绑定 %p", t->tag, mi->methodPointer); break;
-        case 24: mi_bhcDead = mi;      L("tgt[%s] ✓ 绑定 %p", t->tag, mi->methodPointer); break;
-        case 25: mi_bhcChangeHp = mi; mi_bhcChgHp_pt = gzz_param_type(mi, 0);
-                 L("tgt[%s] ✓ 绑定 %p paramType=%d", t->tag, mi->methodPointer, mi_bhcChgHp_pt); break;
-        case 26: mi_bp_TiaoGuo = mi;   L("tgt[%s] ✓ 绑定 %p", t->tag, mi->methodPointer); break;
-        case 27: mi_bm_UpdateResult = mi;
-                 L("tgt[%s] ✓ 绑定 %p paramType=%d (形参是否为 winCamp 待真机验证)",
-                   t->tag, mi->methodPointer, gzz_param_type(mi, 0)); break;
-        default: L("tgt[%s] = 签名记录 %p", t->tag, mi->methodPointer); break;
-    }
-    t->done = 1;
-    g_tgtDone++;
-    if (g_tgtDone == GZZ_NTGT) L("tgt ✓✓ 全部目标处理完成 (k_bhc=%p campOff=%d)", k_bhc, g_bhcCampOff);
 }
 
 // ───────────────────────── 主线程 tick ─────────────────────────
-static int  g_tick = 0;
-static BOOL g_baseDone = NO;
-
+static int   g_tick = 0;
+static BOOL  g_baseDone = NO;
 static NSString *gzz_stat_text(void) {
     return [NSString stringWithFormat:
-        @"跳过%ld  敌伤%ld  图亡%ld  单元%ld\n"
-        @"变速%ld  目标%ld/%d  敌池%@  基址%@",
-        (long)g_nSkip, (long)g_nDamage, (long)g_nMapAtk, (long)g_nChangeHp,
-        (long)g_tsSets, (long)g_tgtDone, GZZ_NTGT,
-        k_fjEnemy ? @"✓" : @"✗", g_unityBase ? @"✓" : @"✗"];
+        @"跳过%ld  敌伤%ld  变速%ld  异常%ld\n"
+        @"目标%ld/%d  敌池%@  基址%@",
+        (long)g_nSkip, (long)g_nDamage, (long)g_nTsSet, (long)g_nExc,
+        (long)g_tgtDone, GZZ_NTGT,
+        k_fjEnemy ? @"OK" : @"--", g_unityBase ? @"OK" : @"--"];
 }
 
 static void gzz_tick(void) {
     g_tick++;
     if (!g_baseDone) { gzz_find_base(); g_baseDone = g_unityBase != 0; }
-
-    if (g_tick > 10 && !g_apiReady && g_unityBase) {
-        if (!gzz_api_init()) { if (g_tick % 60 == 0) L("api 未就绪, 重试中 (tick=%d)", g_tick); }
-    }
+    if (g_tick > 6 && !g_apiReady && g_unityBase) gzz_api_init();
     if (g_apiReady && g_nImg == 0) gzz_load_images();
     if (g_apiReady && g_nImg > 0 && g_tgtDone < GZZ_NTGT) {
-        // 每 tick 解析 1 个 (主线程分步, 避免长时间阻塞)
-        gzz_resolve_step();
-        if (g_tgtDone == GZZ_NTGT) L("tgt ✓✓ 全部目标处理完成");
+        gzz_resolve_step();                 // 每 tick 1 步, 主线程分步
     }
-
-    // 加速: 每 0.25s 直接 invoke Time.set_timeScale (不改 __TEXT → 无签名风险)
-    if (g_speedOn) {
-        static int c = 0;
-        if ((++c % 15) == 0) { gzz_apply_timescale(); gzz_boost_panel(); }
-    }
-    // 目标全部解析完毕后: 先跑一次场景探针 (一次性诊断), 再按开关执行秒杀
     if (g_apiReady && g_tgtDone >= GZZ_NTGT) {
-        static int k = 0;
-        if ((++k % 15) == 0) {
-            gzz_probe_once();
-            if (g_killOn) gzz_kill_pass();
+        static int c = 0;
+        if ((++c % 10) == 0) {              // 0.5s 一轮
+            if (g_killOn)  gzz_kill_pass();
+            if (g_speedOn) gzz_apply_timescale();
+            gzz_probe();
         }
     }
     if (g_stat) g_stat.text = gzz_stat_text();
 }
 
-// ───────────────────────── UI: event helper (target 必须非 nil) ─────────────────────────
-// ⚠️ 铁律: ObjC addTarget: 的 target 为 nil 时事件静默失效. 必须用真实实例.
+// ───────────────────────── 可穿透 overlay ─────────────────────────
+// ⚠️ 不能用「全屏 window + rootViewController」承载 UI: vc.view 铺满且可交互,
+//    hitTest 永远命中它 → 游戏触摸全被吞 (只能点悬浮球)。
+// 做法: 重写 hitTest, 空白处返回 nil 让事件透传到下层游戏窗口;
+//       且绝不 makeKeyAndVisible (抢 key window 会破坏游戏输入链路)。
+@interface GzzOverlayWin : UIWindow
+@end
+@implementation GzzOverlayWin
+- (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
+    UIView *v = [super hitTest:point withEvent:event];
+    if (!v) return nil;
+    if (v == self) return nil;
+    if (self.rootViewController && v == self.rootViewController.view) return nil;
+    return v;
+}
+@end
+
+@interface GzzOverlayVC : UIViewController
+@end
+@implementation GzzOverlayVC
+- (BOOL)shouldAutorotate { return YES; }
+- (UIInterfaceOrientationMask)supportedInterfaceOrientations {
+    return UIInterfaceOrientationMaskAll;
+}
+@end
+
+// ───────────────────────── UI 事件 (target 必须非 nil) ─────────────────────────
 @interface GzzHelper : NSObject
 @property (nonatomic, strong) UIWindow *win;
 @property (nonatomic, strong) UIView   *panel;
 @property (nonatomic, strong) UIButton *ball;
-@property (nonatomic, strong) UISwitch *swKill;
-@property (nonatomic, strong) UISwitch *swSpeed;
-@property (nonatomic, strong) UISwitch *swWin;
-@property (nonatomic, strong) UISegmentedControl *seg;
-@property (nonatomic, strong) NSTimer *timer;
-@property (nonatomic, assign) CGPoint panStart;
-@property (nonatomic, assign) BOOL shown;
+@property (nonatomic, assign) CGPoint  panStart;
+@property (nonatomic, assign) BOOL     shown;
 @end
 
 @implementation GzzHelper
@@ -846,33 +497,26 @@ static GzzHelper *g_h = nil;
 }
 - (void)onBallPan:(UIPanGestureRecognizer *)g {
     CGPoint t = [g translationInView:self.win];
-    if (g.state == UIGestureRecognizerStateBegan) {
-        self.panStart = self.ball.center;
-    } else if (g.state == UIGestureRecognizerStateChanged) {
+    if (g.state == UIGestureRecognizerStateBegan) self.panStart = self.ball.center;
+    else if (g.state == UIGestureRecognizerStateChanged)
         self.ball.center = CGPointMake(self.panStart.x + t.x, self.panStart.y + t.y);
-    }
 }
 - (void)onPanelPan:(UIPanGestureRecognizer *)g {
     CGPoint t = [g translationInView:self.win];
-    if (g.state == UIGestureRecognizerStateBegan) {
-        self.panStart = self.panel.center;
-    } else if (g.state == UIGestureRecognizerStateChanged) {
+    if (g.state == UIGestureRecognizerStateBegan) self.panStart = self.panel.center;
+    else if (g.state == UIGestureRecognizerStateChanged)
         self.panel.center = CGPointMake(self.panStart.x + t.x, self.panStart.y + t.y);
-    }
 }
 - (void)onClose:(id)s { (void)s; self.panel.hidden = YES; }
-- (void)onKill:(UISwitch *)s {
-    g_killOn = s.isOn;
-    L("ui: kill=%d", (int)g_killOn);
-}
+- (void)onKill:(UISwitch *)s  { g_killOn  = s.isOn; L("ui: kill=%d",  (int)g_killOn); }
 - (void)onSpeedSw:(UISwitch *)s {
     g_speedOn = s.isOn;
     L("ui: speed=%d mul=%.1f", (int)g_speedOn, g_speedMul);
-    gzz_apply_timescale();
-}
-- (void)onWin:(UISwitch *)s {
-    g_forceWin = s.isOn;
-    L("ui: forceWin=%d (默认关; 需真机验证 UpdateResult 形参语义)", (int)g_forceWin);
+    if (g_speedOn && mi_setTimeScale) gzz_apply_timescale();
+    else if (!g_speedOn && mi_setTimeScale) {   // 关闭时还原 1.0
+        float v = 1.0f; void *a[1] = { &v };
+        gzz_invoke(mi_setTimeScale, NULL, a, "restore_timeScale");
+    }
 }
 - (void)onSeg:(UISegmentedControl *)s {
     static const float m[] = {1.0f, 2.0f, 3.0f, 5.0f};
@@ -880,22 +524,21 @@ static GzzHelper *g_h = nil;
     if (i < 0 || i > 3) i = 0;
     g_speedMul = m[i];
     L("ui: speedMul=%.1f", g_speedMul);
-    gzz_apply_timescale();
+    if (g_speedOn && mi_setTimeScale) gzz_apply_timescale();
 }
 - (void)onReset:(id)s {
     (void)s;
-    g_nSkip = g_nDamage = g_nChangeHp = g_nMapAtk = g_tsSets = 0;
+    g_nSkip = g_nDamage = g_nTsSet = g_nExc = 0;
     L("ui: counters reset");
 }
 - (void)onScan:(id)s {
-    L("ui: 触发全量类扫描");
-    // 遍历 Assembly-CSharp 全部类, 打印战斗相关类的方法签名
     Il2CppImage *im = gzz_image_named("Assembly-CSharp");
     if (!im || !A.image_get_class_count || !A.image_get_class) { L("scan: 无 API"); return; }
     size_t n = A.image_get_class_count(im);
-    gzz_scan_open();
-    if (g_scanF) fprintf(g_scanF, "---- FULL SCAN image=%s classes=%zu ----\n",
-                         A.image_get_name_ ? A.image_get_name_(im) : "?", n);
+    NSString *d = gzz_doc();
+    FILE *f = d ? fopen([[d stringByAppendingPathComponent:@"gdzz_scan.txt"] fileSystemRepresentation], "a") : NULL;
+    if (!f) { L("scan: 打不开文件"); return; }
+    fprintf(f, "\n==== scan %s ====\n", [[NSDate date] description].UTF8String);
     int hit = 0;
     for (size_t i = 0; i < n; i++) {
         Il2CppClass *k = A.image_get_class(im, i);
@@ -904,166 +547,100 @@ static GzzHelper *g_h = nil;
         const char *ns = A.class_get_namespace ? A.class_get_namespace(k) : "";
         if (!cn) continue;
         if (!strstr(cn, "Battle") && !strstr(cn, "FeiJi") && !strstr(cn, "MapHero") &&
-            !strstr(cn, "GameLevel") && !strstr(cn, "Boss") && !strstr(cn, "HeroCell") &&
-            !strstr(cn, "Damage") && !strstr(cn, "Hurt") && !strstr(cn, "XueZhan")) continue;
+            !strstr(cn, "GameLevel") && !strstr(cn, "Boss") && !strstr(cn, "HeroCell"))
+            continue;
         hit++;
-        if (g_scanF) fprintf(g_scanF, "\n[CLASS] %s.%s\n", ns, cn);
+        fprintf(f, "\n[CLASS] %s.%s\n", ns, cn);
         void *iter = NULL; GzzMethodInfo *mi;
         while (A.class_get_methods && (mi = A.class_get_methods(k, &iter)) != NULL) {
-            if (g_scanF) {
-                const char *rt = "?";
-                if (A.method_get_return_type && A.type_get_name) {
-                    void *rtp = A.method_get_return_type(mi);
-                    if (rtp) { const char *s = A.type_get_name(rtp); if (s) rt = s; }
-                }
-                char pb[512] = {0};
-                int pc = A.method_get_param_count ? A.method_get_param_count(mi) : 0;
-                for (int j = 0; j < pc && j < 8; j++) {
-                    const char *pn = "?";
-                    void *pt = A.method_get_param ? A.method_get_param(mi, j) : NULL;
-                    if (pt && A.type_get_name) { const char *s = A.type_get_name(pt); if (s) pn = s; }
-                    strncat(pb, pn, sizeof(pb) - strlen(pb) - 2);
-                    if (j + 1 < pc) strncat(pb, ", ", sizeof(pb) - strlen(pb) - 2);
-                }
-                fprintf(g_scanF, "  %s(%s) -> %s  %p\n",
-                        A.method_get_name(mi), pb, rt, mi->methodPointer);
+            const char *rt = "?";
+            if (A.method_get_return_type && A.type_get_name) {
+                void *rtp = A.method_get_return_type(mi);
+                if (rtp) { const char *s = A.type_get_name(rtp); if (s) rt = s; }
             }
+            char pb[512] = {0};
+            int pc = A.method_get_param_count ? A.method_get_param_count(mi) : 0;
+            for (int j = 0; j < pc && j < 8; j++) {
+                const char *pn = "?";
+                void *pt = A.method_get_param ? A.method_get_param(mi, j) : NULL;
+                if (pt && A.type_get_name) { const char *s = A.type_get_name(pt); if (s) pn = s; }
+                strncat(pb, pn, sizeof(pb) - strlen(pb) - 2);
+                if (j + 1 < pc) strncat(pb, ", ", sizeof(pb) - strlen(pb) - 2);
+            }
+            fprintf(f, "  %s(%s) -> %s  %p\n", A.method_get_name(mi), pb, rt, mi->methodPointer);
         }
     }
-    if (g_scanF) { fflush(g_scanF); }
+    fclose(f);
     L("scan: 完成, 命中类 %d 个 → Documents/gdzz_scan.txt", hit);
     UIAlertController *a = [UIAlertController alertControllerWithTitle:@"扫描完成"
         message:[NSString stringWithFormat:@"命中 %d 个战斗类\n签名已写入 Documents/gdzz_scan.txt", hit]
         preferredStyle:UIAlertControllerStyleAlert];
     [a addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
-[self presentAlert:a];
+    [self presentAlert:a];
 }
-
-// 弹窗必须经「正在显示的那个窗口」的 rootVC 呈现, 否则会报 "not in window hierarchy"
 - (void)presentAlert:(UIAlertController *)a {
     UIViewController *vc = self.win.rootViewController;
-    UIWindow *key = nil;
     for (UIWindow *w in [UIApplication sharedApplication].windows)
-        if (w.isKeyWindow) { key = w; break; }
-    if (key && key.rootViewController) vc = key.rootViewController;
+        if (w.isKeyWindow && w.rootViewController) { vc = w.rootViewController; break; }
     if (!vc) return;
     if (vc.presentedViewController) vc = vc.presentedViewController;
     [vc presentViewController:a animated:YES completion:nil];
 }
+- (void)onBtn:(UIButton *)b { if (b.tag == 100) [self onReset:b]; else [self onScan:b]; }
 
-- (void)onBtn:(UIButton *)b {
-    if (b.tag == 100) [self onReset:b];
-    else              [self onScan:b];
-}
-
-// 安装: 把所有 target-action / 手势 的真实 target 绑到自己
 - (void)install:(UIWindow *)w panel:(UIView *)pnl ball:(UIButton *)ball
          swKill:(UISwitch *)sk swSpeed:(UISwitch *)ss seg:(UISegmentedControl *)sg
-           swWin:(UISwitch *)sw
         closeBtn:(UIButton *)x {
     self.win = w; self.panel = pnl; self.ball = ball;
-    self.swKill = sk; self.swSpeed = ss; self.seg = sg; self.swWin = sw;
 
     [ball addTarget:self action:@selector(onBallTap:) forControlEvents:UIControlEventTouchUpInside];
-    UIPanGestureRecognizer *bp = [[UIPanGestureRecognizer alloc] initWithTarget:self
-                                                                       action:@selector(onBallPan:)];
-    [ball addGestureRecognizer:bp];
-
-    UIPanGestureRecognizer *pp = [[UIPanGestureRecognizer alloc] initWithTarget:self
-                                                                       action:@selector(onPanelPan:)];
-    [pnl addGestureRecognizer:pp];
-
+    [ball addGestureRecognizer:[[UIPanGestureRecognizer alloc] initWithTarget:self
+                                                                     action:@selector(onBallPan:)]];
+    [pnl addGestureRecognizer:[[UIPanGestureRecognizer alloc] initWithTarget:self
+                                                                    action:@selector(onPanelPan:)]];
     [x addTarget:self action:@selector(onClose:) forControlEvents:UIControlEventTouchUpInside];
     [sk addTarget:self action:@selector(onKill:) forControlEvents:UIControlEventValueChanged];
     [ss addTarget:self action:@selector(onSpeedSw:) forControlEvents:UIControlEventValueChanged];
     [sg addTarget:self action:@selector(onSeg:) forControlEvents:UIControlEventValueChanged];
-    [sw addTarget:self action:@selector(onWin:) forControlEvents:UIControlEventValueChanged];
-    // 等游戏 UI 起来后再显示悬浮球 (避免被游戏的 window 覆盖 / 时机太早被清掉)
     [NSTimer scheduledTimerWithTimeInterval:0.8 target:self
                                    selector:@selector(maybeShow) userInfo:nil repeats:YES];
-    L("ui: helper install ok (target=%p)", self);
+    L("ui: helper install ok");
 }
 
 - (void)maybeShow {
     UIWindow *w = self.win;
     if (!w || w.hidden) return;
     CGRect sb = [UIScreen mainScreen].bounds;
-    if (!CGRectEqualToRect(w.bounds, sb)) w.frame = sb;
+    if (w.bounds.size.width != sb.size.width || w.bounds.size.height != sb.size.height)
+        w.frame = sb;
     if (!self.shown) {
         self.shown = YES;
         self.ball.hidden = NO;
         [w bringSubviewToFront:self.ball];
-        L("ui: 悬浮球已显示 (%@) win.hidden=%d key=%d",
-          NSStringFromCGRect(self.ball.frame), (int)w.hidden, (int)w.isKeyWindow);
-    } else if (!self.ball.hidden) {
-        [w bringSubviewToFront:self.ball];
-        if (!self.panel.hidden) [w bringSubviewToFront:self.panel];
+        L("ui: 悬浮球已显示");
+    } else if (!self.panel.hidden) {
+        [w bringSubviewToFront:self.panel];
     }
 }
 @end
 
-// ⚠️ 关键: 不能用「全屏 UIWindow + rootViewController」承载悬浮 UI。
-//    那样 vc.view 会铺满全屏且 userInteractionEnabled=YES → hitTest 永远命中它,
-//    游戏的所有触摸被吃掉 (只能点到悬浮球)。踩坑记录。
-//    正解: ① 优先直接挂到游戏自己的 window; ② 拿不到时才建一个【可穿透】overlay,
-//         其 rootViewController.view 的 hitTest 在空白处返回 nil → 事件透传给下层游戏。
-static UIView *g_hostRoot = nil;      // 承载悬浮 UI 的根视图
-
-// ⚠️ 关键设计: 悬浮层必须【可穿透】, 否则会吃掉游戏的全部触摸 (本次真机反馈的问题)。
-//    做法 = 独立 overlay window + 重写 hitTest: 只有落在我们自己的子视图
-//    (悬浮球/面板及其子控件) 上才返回该视图, 其余一律返回 nil → 事件透传到下层游戏窗口。
-@interface GzzOverlayWin : UIWindow
-@end
-@implementation GzzOverlayWin
-- (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
-    UIView *v = [super hitTest:point withEvent:event];
-    if (!v) return nil;
-    if (v == self) return nil;                                   // 空白处 → 穿透
-    if (self.rootViewController && v == self.rootViewController.view) return nil;
-    return v;                                                    // 命中我们的控件
-}
-@end
-
-@interface GzzOverlayVC : UIViewController
-@end
-@implementation GzzOverlayVC
-- (BOOL)shouldAutorotate { return YES; }
-- (UIInterfaceOrientationMask)supportedInterfaceOrientations {
-    return UIInterfaceOrientationMaskAll;
-}
-@end
-
-// 找一个可参考的宿主窗口 (只用来同步尺寸/朝向, 不挂子视图)
-static UIWindow *gzz_game_window(void) {
-    UIWindow *best = nil;
-    for (UIWindow *w in [UIApplication sharedApplication].windows) {
-        if (w == g_win || w.hidden || w.alpha < 0.01) continue;
-        if (!best || w.windowLevel < best.windowLevel) best = w;
-    }
-    return best;
-}
-
+// ───────────────────────── 构建 UI ─────────────────────────
 static void gzz_build_ui(void) {
-    GzzHelper *H = [GzzHelper new];
-    g_h = H;
+    CGRect sb = [UIScreen mainScreen].bounds;
 
-    // 独立可穿透 overlay (windowLevel 高于游戏、低于系统弹窗)
-    GzzOverlayWin *w = [[GzzOverlayWin alloc] initWithFrame:[UIScreen mainScreen].bounds];
+    GzzOverlayWin *w = [[GzzOverlayWin alloc] initWithFrame:sb];
     w.windowLevel = UIWindowLevelNormal + 10;
     w.backgroundColor = [UIColor clearColor];
     w.opaque = NO;
     GzzOverlayVC *vc = [GzzOverlayVC new];
     w.rootViewController = vc;
-    w.hidden = NO;                 // ⚠️ 绝不 makeKeyAndVisible: 抢 key 会破坏游戏输入
+    w.hidden = NO;                       // ⚠️ 绝不 makeKeyAndVisible
     g_win = w;
-    g_hostRoot = vc.view;
-    g_hostRoot.backgroundColor = [UIColor clearColor];
-    UIWindow *gw = gzz_game_window();
-    L("ui: 可穿透 overlay level=%.0f 已创建; 参考宿主窗口=%p (level=%.0f)",
-      w.windowLevel, gw, gw ? gw.windowLevel : -1);
+    vc.view.backgroundColor = [UIColor clearColor];
+    L("ui: 可穿透 overlay 已创建 (level=%.0f)", w.windowLevel);
 
-    UIView *vcv = g_hostRoot;
-    CGRect sb = [UIScreen mainScreen].bounds;
+    GzzHelper *H = [GzzHelper new];
+    g_h = H;
 
     // 悬浮球
     CGFloat bs = 56;
@@ -1073,39 +650,34 @@ static void gzz_build_ui(void) {
     g_ball.layer.cornerRadius = bs / 2;
     g_ball.layer.borderWidth = 2;
     g_ball.layer.borderColor = [UIColor whiteColor].CGColor;
-    g_ball.layer.shadowColor = [UIColor blackColor].CGColor;
-    g_ball.layer.shadowOpacity = 0.45;
-    g_ball.layer.shadowRadius = 6;
-    g_ball.layer.shadowOffset = CGSizeMake(0, 2);
     [g_ball setTitle:@"战" forState:UIControlStateNormal];
     g_ball.titleLabel.font = [UIFont boldSystemFontOfSize:22];
-    [vcv addSubview:g_ball];
-    g_ball.hidden = YES;          // 由 helper 延迟到游戏启动完成后显示
+    g_ball.hidden = YES;                 // 由 maybeShow 延迟显示
+    [vc.view addSubview:g_ball];
 
     // 面板
-    CGFloat pw = 268, ph = 348;
+    CGFloat pw = 264, ph = 288;
     g_panel = [[UIView alloc] initWithFrame:CGRectMake(12, 90, pw, ph)];
     g_panel.backgroundColor = [UIColor colorWithWhite:0.06 alpha:0.93];
     g_panel.layer.cornerRadius = 14;
     g_panel.layer.borderWidth = 1;
     g_panel.layer.borderColor = [UIColor colorWithWhite:1 alpha:0.22].CGColor;
     g_panel.hidden = YES;
-    [vcv addSubview:g_panel];
+    [vc.view addSubview:g_panel];
 
-    UILabel *t = [[UILabel alloc] initWithFrame:CGRectMake(12, 8, pw - 60, 22)];
-    t.text = @"古代战争助手 v1";
+    UILabel *t = [[UILabel alloc] initWithFrame:CGRectMake(14, 8, pw - 60, 22)];
+    t.text = @"古代战争助手 v3";
     t.textColor = [UIColor whiteColor];
     t.font = [UIFont boldSystemFontOfSize:15];
     [g_panel addSubview:t];
 
     UIButton *x = [UIButton buttonWithType:UIButtonTypeSystem];
-    x.frame = CGRectMake(pw - 40, 6, 32, 26);
+    x.frame = CGRectMake(pw - 42, 6, 34, 26);
     [x setTitle:@"✕" forState:UIControlStateNormal];
     x.titleLabel.font = [UIFont systemFontOfSize:17];
     [g_panel addSubview:x];
 
-    // 秒杀开关
-    UILabel *l1 = [[UILabel alloc] initWithFrame:CGRectMake(14, 38, 140, 30)];
+    UILabel *l1 = [[UILabel alloc] initWithFrame:CGRectMake(14, 38, 150, 30)];
     l1.text = @"秒杀 / 自动跳过";
     l1.textColor = [UIColor colorWithWhite:0.93 alpha:1];
     l1.font = [UIFont systemFontOfSize:13.5];
@@ -1114,8 +686,7 @@ static void gzz_build_ui(void) {
     g_swKill.transform = CGAffineTransformMakeScale(0.86, 0.86);
     [g_panel addSubview:g_swKill];
 
-    // 加速开关
-    UILabel *l2 = [[UILabel alloc] initWithFrame:CGRectMake(14, 72, 140, 30)];
+    UILabel *l2 = [[UILabel alloc] initWithFrame:CGRectMake(14, 72, 150, 30)];
     l2.text = @"全局加速";
     l2.textColor = [UIColor colorWithWhite:0.93 alpha:1];
     l2.font = [UIFont systemFontOfSize:13.5];
@@ -1124,40 +695,27 @@ static void gzz_build_ui(void) {
     g_swSpeed.transform = CGAffineTransformMakeScale(0.86, 0.86);
     [g_panel addSubview:g_swSpeed];
 
-    // 倍率
-    UILabel *l3 = [[UILabel alloc] initWithFrame:CGRectMake(14, 108, pw - 28, 16)];
+    UILabel *l3 = [[UILabel alloc] initWithFrame:CGRectMake(14, 106, pw - 28, 16)];
     l3.text = @"加速倍率";
     l3.textColor = [UIColor colorWithWhite:0.66 alpha:1];
     l3.font = [UIFont systemFontOfSize:11.5];
     [g_panel addSubview:l3];
     g_segSpeed = [[UISegmentedControl alloc] initWithItems:@[@"1x", @"2x", @"3x", @"5x"]];
-    g_segSpeed.frame = CGRectMake(12, 124, pw - 24, 28);
-    g_segSpeed.selectedSegmentIndex = 2;
+    g_segSpeed.frame = CGRectMake(12, 122, pw - 24, 28);
+    g_segSpeed.selectedSegmentIndex = 1;      // 默认 2x
     [g_panel addSubview:g_segSpeed];
 
-    // 强制胜利 (需真机验证)
-    UILabel *l4 = [[UILabel alloc] initWithFrame:CGRectMake(14, 158, 160, 30)];
-    l4.text = @"强制胜利 (待验证)";
-    l4.textColor = [UIColor colorWithRed:1 green:0.78 blue:0.35 alpha:1];
-    l4.font = [UIFont systemFontOfSize:13];
-    [g_panel addSubview:l4];
-    g_swWin = [[UISwitch alloc] initWithFrame:CGRectMake(pw - 66, 158, 51, 31)];
-    g_swWin.transform = CGAffineTransformMakeScale(0.86, 0.86);
-    [g_panel addSubview:g_swWin];
-
-    // 状态
-    g_stat = [[UILabel alloc] initWithFrame:CGRectMake(12, 194, pw - 24, 76)];
+    g_stat = [[UILabel alloc] initWithFrame:CGRectMake(12, 156, pw - 24, 56)];
     g_stat.numberOfLines = 0;
     g_stat.textColor = [UIColor colorWithRed:0.55 green:0.92 blue:0.62 alpha:1];
-    g_stat.font = [UIFont fontWithName:@"Menlo" size:10.5] ?: [UIFont systemFontOfSize:10.5];
+    g_stat.font = [UIFont fontWithName:@"Menlo" size:10] ?: [UIFont systemFontOfSize:10];
     g_stat.text = @"…";
     [g_panel addSubview:g_stat];
 
-    // 按钮
     NSArray *titles = @[@"重置计数", @"扫描战斗类"];
     for (int i = 0; i < 2; i++) {
         UIButton *b = [UIButton buttonWithType:UIButtonTypeSystem];
-        b.frame = CGRectMake(12 + i * ((pw - 36) / 2 + 12), 276, (pw - 36) / 2, 34);
+        b.frame = CGRectMake(12 + i * ((pw - 36) / 2 + 12), 216, (pw - 36) / 2, 34);
         [b setTitle:titles[i] forState:UIControlStateNormal];
         [b setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
         b.titleLabel.font = [UIFont systemFontOfSize:13];
@@ -1166,27 +724,21 @@ static void gzz_build_ui(void) {
             : [UIColor colorWithRed:0.62 green:0.30 blue:0.16 alpha:1];
         b.layer.cornerRadius = 8;
         b.tag = 100 + i;
+        [b addTarget:H action:@selector(onBtn:) forControlEvents:UIControlEventTouchUpInside];
         [g_panel addSubview:b];
     }
 
-    UILabel *tip = [[UILabel alloc] initWithFrame:CGRectMake(12, 322, pw - 24, 18)];
+    UILabel *tip = [[UILabel alloc] initWithFrame:CGRectMake(12, 258, pw - 24, 18)];
     tip.text = @"联机玩法(竞技场/跨服)勿开秒杀";
     tip.textColor = [UIColor colorWithRed:1 green:0.55 blue:0.35 alpha:1];
     tip.font = [UIFont systemFontOfSize:10];
     [g_panel addSubview:tip];
 
-    // 事件桥: target 必须是非 nil 的真实实例
-    for (int i = 0; i < 2; i++) {
-        UIButton *b = (UIButton *)[g_panel viewWithTag:100 + i];
-        [b addTarget:H action:@selector(onBtn:) forControlEvents:UIControlEventTouchUpInside];
-    }
     [H install:w panel:g_panel ball:g_ball
-         swKill:g_swKill swSpeed:g_swSpeed seg:g_segSpeed swWin:g_swWin closeBtn:x];
-    L("ui: 悬浮球+面板已创建 (%@)", NSStringFromCGRect(g_panel.frame));
+         swKill:g_swKill swSpeed:g_swSpeed seg:g_segSpeed closeBtn:x];
 }
 
 // ───────────────────────── 入口 ─────────────────────────
-// NSTimer 的 target 必须非 nil → 用类对象承载类方法
 @interface GzzTickKeeper : NSObject
 + (void)fire;
 @end
@@ -1194,18 +746,15 @@ static void gzz_build_ui(void) {
 + (void)fire { gzz_tick(); }
 @end
 
-// ⚠️ 只 hook 主线程入口 (UIApplicationDelegate didFinishLaunching), 不做后台线程
-//    il2cpp 首调 (Assembly 惰性初始化与主线程竞态 → SIGSEGV, 已有两次教训).
 __attribute__((constructor))
 static void gzz_ctor(void) {
-    L("ctor: GZZ v1 载入 (pid=%d)", getpid());
+    L("ctor: GZZ v3 载入 (pid=%d)", getpid());
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
         gzz_build_ui();
         gzz_find_base();
-        L("ctor: base=%p text=0x%llx → tick 启动", (void*)g_unityBase, g_textSize);
         [NSTimer scheduledTimerWithTimeInterval:0.5 target:[GzzTickKeeper class]
-                                       selector:@selector(fire)
-                                       userInfo:nil repeats:YES];
+                                       selector:@selector(fire) userInfo:nil repeats:YES];
+        L("ctor: tick 启动");
     });
 }
