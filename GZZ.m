@@ -142,6 +142,24 @@ typedef struct {
 static GzzApi A;
 static BOOL g_apiReady = NO;
 
+// il2cpp Il2CppTypeEnum (il2cpp-api-types.h) —— 之前用错了码, 导致误判形参类型
+#define GZZ_T_VOID     0x01
+#define GZZ_T_BOOLEAN  0x02   // bool
+#define GZZ_T_I4       0x08   // int
+#define GZZ_T_U4       0x09   // uint
+#define GZZ_T_I8       0x0A   // long
+#define GZZ_T_R4       0x0C   // float   ⚠️ 不是 13
+#define GZZ_T_R8       0x0D   // double
+#define GZZ_T_STRING   0x0E
+#define GZZ_T_VALUETYPE 0x11
+#define GZZ_T_CLASS    0x12   // 引用类型对象 → 严禁传 NULL
+
+// 返回值是否可安全解引用 (只认这几个值类型)
+static int gzz_type_is_num(int t) {
+    return (t == GZZ_T_I4 || t == GZZ_T_U4 || t == GZZ_T_I8 ||
+            t == GZZ_T_R4 || t == GZZ_T_R8 || t == GZZ_T_BOOLEAN);
+}
+
 // ───────────────────────── 前向声明 (gzz_find_objects / tick 需要) ─────────────────────────
 static GzzMethodInfo *mi_findObjType  = NULL;
 static GzzMethodInfo *mi_setTimeScale = NULL;
@@ -149,7 +167,6 @@ static GzzMethodInfo *mi_fjDamage     = NULL;
 static GzzMethodInfo *mi_fjCrash      = NULL;
 static GzzMethodInfo *mi_bpTiaoGuo    = NULL;
 static GzzMethodInfo *mi_bp2Ctor      = NULL;
-static GzzMethodInfo *mi_uiGetSpd     = NULL;
 static GzzMethodInfo *mi_spdBtnClick  = NULL;
 static int            mi_fjDamage_pt  = -1;
 static int            mi_spdBtn_pt    = -1;
@@ -158,13 +175,15 @@ static Il2CppClass   *k_fjEnemy = NULL, *k_bp = NULL, *k_bp2 = NULL, *k_ui = NUL
 // ⭐ 核心决策 (v3.1): 回合战斗由客户端按服务器下发的 BattleLog 播放。
 //    「跳过(TiaoGuo)」= 放弃本场 → 判负 (真机日志已证实, 累计 11 次全是失败)。
 //    能"赢着秒完"的做法 = 把【播放速度】拉到极限, 战斗几秒播完 → 正常结算我方胜。
-static BOOL g_battleSpeedSet = NO;
+static BOOL  g_battleSpeedSet = NO;
+static BOOL  g_inBattle       = NO;   // 当前是否处于战斗 (决定变速目标)
+static float g_appliedTs      = 1.0f; // 已施加的 timeScale (避免重复调用)
+static float g_killMul        = 8.0f; // 「秒杀」开启时的战斗快进倍率
 static BOOL g_useTiaoGuo     = NO;   // 是否使用 TiaoGuo (默认关: 会判负)
 static int  g_speedIdx       = 3;    // 战斗倍速档位
-static int  g_maxSpeedIdx    = 0;    // 由 GetNowBattleSpeed 探针发现的最大档位
 
 static void gzz_probe_speed(void);
-static void gzz_set_battle_speed(int idx);
+static void gzz_apply_timescale_v(float v);
 
 static void *GZ(const char *n) {
     void *p = dlsym(RTLD_DEFAULT, n);
@@ -363,10 +382,12 @@ static void gzz_resolve_step(void) {
             break;
         }
         case 7: {
+            // ⚠️ 只记录, 绝不调用: GetNowBattleSpeed() 返回 System.Void,
+            //    对其返回值解引用会野指针读 → 闪退 (v3.1 事故根因)。
             k_ui = gzz_class("Assembly-CSharp", "JiuShiZhu", "UIDataModel");
-            mi_uiGetSpd = k_ui ? gzz_find_method(k_ui, "GetNowBattleSpeed", 0) : NULL;
-            L("tgt: UIDataModel=%p GetNowBattleSpeed=%p", k_ui,
-              mi_uiGetSpd ? mi_uiGetSpd->methodPointer : NULL);
+            GzzMethodInfo *mi = k_ui ? gzz_find_method(k_ui, "GetNowBattleSpeed", 0) : NULL;
+            L("tgt: UIDataModel=%p GetNowBattleSpeed=%p (返回 void, 仅记录)",
+              k_ui, mi ? mi->methodPointer : NULL);
             break;
         }
         case 8: {
@@ -381,11 +402,17 @@ static void gzz_resolve_step(void) {
                         int pc = A.method_get_param_count ? A.method_get_param_count(mi) : -1;
                         L("tgt: BattleSpeedComponent.BtnClick/%d = %p", pc, mi->methodPointer);
                         if (mi_spdBtnClick == NULL) {
-                            mi_spdBtnClick = mi;
                             mi_spdBtn_pt = -1;
                             if (pc == 1 && A.method_get_param && A.type_get_type) {
                                 void *pt = A.method_get_param(mi, 0);
                                 if (pt) mi_spdBtn_pt = A.type_get_type(pt);
+                            }
+                            // 只有形参是【数值】才敢绑定调用; CLASS(18) 传 NULL 会崩
+                            if (gzz_type_is_num(mi_spdBtn_pt)) {
+                                mi_spdBtnClick = mi;
+                                L("tgt: BtnClick 形参为数值(%d) → 可用", mi_spdBtn_pt);
+                            } else {
+                                L("tgt: ⚠️ BtnClick 形参=%d 非数值 → 放弃调用该路径", mi_spdBtn_pt);
                             }
                         }
                     }
@@ -398,24 +425,36 @@ static void gzz_resolve_step(void) {
         case 9: {
             L("tgt: 解析完成 (FeiJi=%d Damage=%d BP2=%d UISpd=%d SpdBtn=%d)",
               k_fjEnemy != NULL, mi_fjDamage != NULL, k_bp2 != NULL,
-              mi_uiGetSpd != NULL, mi_spdBtnClick != NULL);
+              k_ui != NULL, mi_spdBtnClick != NULL);
             break;
         }
         case 10: {
-            gzz_probe_speed();
+            // 探测 BattleHeroCell::BattleSpeedChange(int) 的形参类型 (不调用, 只记录)
+            Il2CppClass *kb = gzz_class("Assembly-CSharp", "JiuShiZhu", "BattleHeroCell");
+            if (kb) {
+                GzzMethodInfo *mb = gzz_find_method(kb, "BattleSpeedChange", 1);
+                int pt = -1;
+                if (mb && A.method_get_param && A.type_get_type) {
+                    void *p0 = A.method_get_param(mb, 0);
+                    if (p0) pt = A.type_get_type(p0);
+                }
+                L("probe: BattleHeroCell.BattleSpeedChange=%p paramType=%d (数值=%d)",
+                  mb ? mb->methodPointer : NULL, pt, gzz_type_is_num(pt));
+            }
             break;
         }
     }
 }
 
 // ───────────────────────── 加速: 只走 UnityEngine.Time.set_timeScale ─────────────────────────
-static void gzz_apply_timescale(void) {
+static void gzz_apply_timescale_v(float v) {
     if (!mi_setTimeScale) return;
-    float v = g_speedMul > 20.0f ? 20.0f : g_speedMul;
+    if (v > 20.0f) v = 20.0f;
     void *args[1] = { &v };
     gzz_invoke(mi_setTimeScale, NULL, args, "Time.set_timeScale");
     g_nTsSet++;
 }
+static void gzz_apply_timescale(void) { gzz_apply_timescale_v(g_speedMul); }
 
 // ───────────────────────── 秒杀: 只调游戏自己的业务方法 ─────────────────────────
 // ① 飞机大战 / 探索小游戏敌人: FeiJiEnemy::Damage(int) 喂大数 (客户端模拟, 安全)
@@ -425,8 +464,10 @@ static int gzz_kill_enemies(void) {
     if (k_fjEnemy && mi_fjDamage) {
         int n = gzz_find_objects(k_fjEnemy, buf, 256);
         for (int i = 0; i < n; i++) {
-            if (mi_fjDamage_pt == 13) { float f = 9.9e8f;     void *a[1] = { &f };
+            if (mi_fjDamage_pt == GZZ_T_R4) { float f = 9.9e8f;  void *a[1] = { &f };
                                         gzz_invoke(mi_fjDamage, buf[i], a, "FeiJiEnemy.Damage(f)"); }
+            else if (mi_fjDamage_pt == GZZ_T_R8) { double d = 9.9e8; void *a[1] = { &d };
+                                        gzz_invoke(mi_fjDamage, buf[i], a, "FeiJiEnemy.Damage(d)"); }
             else                      { int32_t v = 999999999; void *a[1] = { &v };
                                         gzz_invoke(mi_fjDamage, buf[i], a, "FeiJiEnemy.Damage(i)"); }
             done++;
@@ -439,42 +480,14 @@ static int gzz_kill_enemies(void) {
     return done;
 }
 
-// ② 回合战斗「秒完」—— 设置游戏自带的战斗倍速, 把 BattleLog 播放拉到极限。
-//    战斗会以极高速度播完, 玩家看不到过程 → 正常结算为我方胜。
-//    ⚠️ 不调用 TiaoGuo(): 那是"跳过=放弃本场", 直接判负 (真机日志已证实)。
-static void gzz_set_battle_speed(int idx) {
-    // 方式 A: 直接调用游戏的倍速组件按钮 (走游戏自己的逻辑, 最安全)
-    if (mi_spdBtnClick && k_spd) {
-        static Il2CppObject *buf[8];
-        int n = gzz_find_objects(k_spd, buf, 8);
-        for (int i = 0; i < n; i++) {
-            if (mi_spdBtn_pt == 9) {          // bool
-                bool b = true; void *a[1] = { &b };
-                gzz_invoke(mi_spdBtnClick, buf[i], a, "BattleSpeedComponent.BtnClick(bool)");
-            } else if (mi_spdBtn_pt == 8) {   // int
-                int32_t v = idx; void *a[1] = { &v };
-                gzz_invoke(mi_spdBtnClick, buf[i], a, "BattleSpeedComponent.BtnClick(int)");
-            } else {                           // 对象参数 (UI 事件) → 传 NULL 不可靠, 跳过
-                return;
-            }
-        }
-        if (n) return;
-    }
-    // 方式 B: 反复调用 GetNowBattleSpeed() 强制刷新显示 (部分实现会顺带更新内部倍速)
-    if (mi_uiGetSpd) gzz_invoke(mi_uiGetSpd, NULL, NULL, "UIDataModel.GetNowBattleSpeed");
-}
-
-// 探针: 读取游戏当前战斗倍速档位 (用于校准)
-static void gzz_probe_speed(void) {
-    static int logged = 0;
-    if (logged || !mi_uiGetSpd) return;
-    Il2CppObject *r = gzz_invoke(mi_uiGetSpd, NULL, NULL, "GetNowBattleSpeed");
-    if (r) {
-        int32_t v = *(int32_t *)((char *)r + sizeof(void *) * 2);
-        g_maxSpeedIdx = v;
-        L("probe: UIDataModel.GetNowBattleSpeed() = %d (最大档位)", v);
-        logged = 1;
-    }
+// ② 回合战斗「快进」—— 只能用已验证安全的 Time.set_timeScale 拉高播放速度。
+//    ⚠️ 三次尝试均被真机日志否掉, 记录在此避免重蹈:
+//      · TiaoGuo()        = 游戏"跳过"按钮 → 放弃本场, 直接判负
+//      · BtnClick/1       = 形参 paramType=18 (CLASS, UI 事件对象) → 传 NULL 必崩
+//      · GetNowBattleSpeed= 返回 System.Void → 解引用返回值必崩
+//    故"必胜秒杀"在本游戏不可实现 (结算服务端权威), 这里提供"极速播完"等效体验。
+static void gzz_set_battle_speed(void) {
+    // 战斗中的目标 timeScale 由 gzz_tick 统一计算与施加, 这里只维护战斗状态标记。
 }
 
 static int gzz_autoskip(void) {
@@ -499,25 +512,18 @@ static int gzz_autoskip(void) {
     return did;
 }
 
-// 战斗实例出现 → 立刻把播放速度拉满
+// 检测战斗是否进行中 (只做实例存在性检查, 不调用任何方法)
 static void gzz_boost_battle(void) {
-    if (k_bp2 || k_bp) {
-        Il2CppObject *dummy[4];
-        int n = 0;
-        if (k_bp)  n += gzz_find_objects(k_bp,  dummy, 4);
-        if (k_bp2) n += gzz_find_objects(k_bp2, dummy, 4);
-        if (n > 0) {
-            gzz_set_battle_speed(g_speedIdx); g_nBoost++;
-            if (!g_battleSpeedSet) {
-                g_battleSpeedSet = YES;
-                L("kill: 战斗中 → 已施加极限倍速 (档位 %d)", g_speedIdx);
-            }
-        } else if (g_battleSpeedSet) {
-            g_battleSpeedSet = NO;
-            g_seenN = 0;
-            L("kill: 战斗结束 → 复位倍速标记");
-        }
+    static Il2CppObject *dummy[4];
+    int n = 0;
+    if (k_bp)  n += gzz_find_objects(k_bp,  dummy, 4);
+    if (k_bp2) n += gzz_find_objects(k_bp2, dummy, 4);
+    BOOL now = (n > 0);
+    if (now != g_inBattle) {
+        g_inBattle = now;
+        L("kill: %s", now ? "战斗中 → 启用极速播完" : "战斗结束 → 恢复常规倍率");
     }
+    if (now) g_nBoost++;
 }
 
 static void gzz_kill_pass(void) {
@@ -551,11 +557,11 @@ static int   g_tick = 0;
 static BOOL  g_baseDone = NO;
 static NSString *gzz_stat_text(void) {
     return [NSString stringWithFormat:
-        @"战斗加速%ld  敌伤%ld  全局%ld  异常%ld\n"
-        @"倍速档%ld  目标%ld/%d  敌池%@",
-        (long)g_nBoost, (long)g_nDamage, (long)g_nTsSet, (long)g_nExc,
-        (long)g_maxSpeedIdx, (long)g_tgtDone, GZZ_NTGT,
-        k_fjEnemy ? @"OK" : @"--"];
+        @"战斗%@  快进%0.1fx  敌伤%ld  异常%ld\n"
+        @"目标%ld/%d  敌池%@  变速率%0.1fx",
+        g_inBattle ? @"中" : @"--", g_killOn ? g_killMul : 1.0f,
+        (long)g_nDamage, (long)g_nExc,
+        (long)g_tgtDone, GZZ_NTGT, k_fjEnemy ? @"OK" : @"--", g_appliedTs];
 }
 
 static void gzz_tick(void) {
@@ -569,10 +575,15 @@ static void gzz_tick(void) {
     if (g_apiReady && g_tgtDone >= GZZ_NTGT) {
         static int c = 0;
         if ((++c % 10) == 0) {              // 0.5s 一轮
-            if (g_killOn)  gzz_kill_pass();
-            if (g_speedOn) gzz_apply_timescale();
+            if (g_killOn) gzz_kill_pass();
             gzz_probe();
         }
+        // 变速: 统一出口。战斗中(秒杀开) → 取二者较大值, 让战斗极速播完
+        float want = 1.0f;
+        if (g_speedOn) want = g_speedMul;
+        if (g_killOn && g_inBattle && g_killMul > want) want = g_killMul;
+        if (want > 20.0f) want = 20.0f;
+        if (want != g_appliedTs) { g_appliedTs = want; gzz_apply_timescale_v(want); }
     }
     if (g_stat) g_stat.text = gzz_stat_text();
 }
