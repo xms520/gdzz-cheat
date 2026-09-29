@@ -592,6 +592,18 @@ static void gzz_probe_once(void) {
     if (total > 0) done = 1;
 }
 
+// ④ 加速兜底: 直接写 BattlePanel._timeScale (游戏自带的战斗倍速字段)
+//    ⚠️【推测，人工验证】字段名 _timeScale 来自元数据 (typeIdx 为 float)。
+//       若真机日志显示 off<=0 或改后无效果, 请只用全局 timeScale 那条路径。
+static int gzz_boost_panel(void) {
+    static Il2CppObject *buf[32];
+    if (!k_bp || g_bpTimeScale < 0) return 0;
+    int n = gzz_find_objects(k_bp, buf, 32);
+    for (int i = 0; i < n; i++)
+        *(float *)((char *)buf[i] + g_bpTimeScale) = g_speedMul;
+    return n;
+}
+
 static void gzz_kill_pass(void) {
     gzz_probe_once();
     if (!g_killOn) return;
