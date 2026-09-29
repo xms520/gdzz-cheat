@@ -78,6 +78,7 @@ static UIButton *g_ball = nil;
 static UIView   *g_panel = nil;
 static UILabel  *g_stat = nil;
 static UISwitch *g_swKill = nil, *g_swSpeed = nil, *g_swWin = nil;
+static UIWindow *g_win = nil;
 static UISegmentedControl *g_segSpeed = nil;
 
 // ───────────────────────── Mach-O ─────────────────────────
