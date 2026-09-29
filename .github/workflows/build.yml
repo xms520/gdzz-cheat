@@ -1,0 +1,50 @@
+name: build-gdzz-dylib
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+    paths:
+      - 'GZZ.m'
+      - '.github/workflows/build.yml'
+
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build GZZ.dylib (arm64)
+        run: |
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          echo "SDK: $SDK"
+          xcrun -sdk iphoneos clang \
+            -arch arm64 \
+            -miphoneos-version-min=15.0 \
+            -framework Foundation \
+            -framework UIKit \
+            -framework CoreGraphics \
+            -framework QuartzCore \
+            -dynamiclib \
+            -fobjc-arc \
+            -O1 \
+            -Wall \
+            -Wno-deprecated-declarations \
+            -Wno-unused-function \
+            -Wno-format \
+            -o GZZ.dylib \
+            GZZ.m
+          file GZZ.dylib
+          ls -la GZZ.dylib
+
+      - name: Verify
+        run: |
+          vtool -show-build GZZ.dylib || true
+          otool -L GZZ.dylib || true
+          md5 GZZ.dylib
+          shasum -a 256 GZZ.dylib
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: GZZ.dylib
+          path: GZZ.dylib
