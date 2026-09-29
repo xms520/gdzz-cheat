@@ -1063,6 +1063,7 @@ static void gzz_build_ui(void) {
       w.windowLevel, gw, gw ? gw.windowLevel : -1);
 
     UIView *vcv = g_hostRoot;
+    CGRect sb = [UIScreen mainScreen].bounds;
 
     // 悬浮球
     CGFloat bs = 56;
