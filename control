@@ -1,0 +1,9 @@
+Package: com.xms520.gdzz
+Name: 古代战争助手
+Version: 1.0.0
+Architecture: iphoneos-arm
+Description: 古代战争 2.4.1 悬浮助手 (秒杀 / 自动跳过战斗 / 全局加速) — 单机玩法专用
+Maintainer: xms520
+Author: xms520
+Section: Tweaks
+Depends: mobilesubstrate
