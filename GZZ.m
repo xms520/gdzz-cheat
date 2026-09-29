@@ -832,6 +832,7 @@ static void gzz_tick(void) {
 @property (nonatomic, strong) UISegmentedControl *seg;
 @property (nonatomic, strong) NSTimer *timer;
 @property (nonatomic, assign) CGPoint panStart;
+@property (nonatomic, assign) BOOL shown;
 @end
 
 @implementation GzzHelper
@@ -935,7 +936,19 @@ static GzzHelper *g_h = nil;
         message:[NSString stringWithFormat:@"命中 %d 个战斗类\n签名已写入 Documents/gdzz_scan.txt", hit]
         preferredStyle:UIAlertControllerStyleAlert];
     [a addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
-    [self.win.rootViewController presentViewController:a animated:YES completion:nil];
+[self presentAlert:a];
+}
+
+// 弹窗必须经「正在显示的那个窗口」的 rootVC 呈现, 否则会报 "not in window hierarchy"
+- (void)presentAlert:(UIAlertController *)a {
+    UIViewController *vc = self.win.rootViewController;
+    UIWindow *key = nil;
+    for (UIWindow *w in [UIApplication sharedApplication].windows)
+        if (w.isKeyWindow) { key = w; break; }
+    if (key && key.rootViewController) vc = key.rootViewController;
+    if (!vc) return;
+    if (vc.presentedViewController) vc = vc.presentedViewController;
+    [vc presentViewController:a animated:YES completion:nil];
 }
 
 - (void)onBtn:(UIButton *)b {
@@ -965,23 +978,91 @@ static GzzHelper *g_h = nil;
     [ss addTarget:self action:@selector(onSpeedSw:) forControlEvents:UIControlEventValueChanged];
     [sg addTarget:self action:@selector(onSeg:) forControlEvents:UIControlEventValueChanged];
     [sw addTarget:self action:@selector(onWin:) forControlEvents:UIControlEventValueChanged];
+    // 等游戏 UI 起来后再显示悬浮球 (避免被游戏的 window 覆盖 / 时机太早被清掉)
+    [NSTimer scheduledTimerWithTimeInterval:0.8 target:self
+                                   selector:@selector(maybeShow) userInfo:nil repeats:YES];
     L("ui: helper install ok (target=%p)", self);
+}
+
+- (void)maybeShow {
+    UIWindow *w = self.win;
+    if (!w || w.hidden) return;
+    CGRect sb = [UIScreen mainScreen].bounds;
+    if (!CGRectEqualToRect(w.bounds, sb)) w.frame = sb;
+    if (!self.shown) {
+        self.shown = YES;
+        self.ball.hidden = NO;
+        [w bringSubviewToFront:self.ball];
+        L("ui: 悬浮球已显示 (%@) win.hidden=%d key=%d",
+          NSStringFromCGRect(self.ball.frame), (int)w.hidden, (int)w.isKeyWindow);
+    } else if (!self.ball.hidden) {
+        [w bringSubviewToFront:self.ball];
+        if (!self.panel.hidden) [w bringSubviewToFront:self.panel];
+    }
 }
 @end
 
-static void gzz_build_ui(void) {
-    CGRect sb = [UIScreen mainScreen].bounds;
-    UIWindow *w = [[UIWindow alloc] initWithFrame:sb];
-    w.windowLevel = UIWindowLevelAlert + 100;
-    w.backgroundColor = [UIColor clearColor];
-    UIViewController *vc = [UIViewController new];
-    w.rootViewController = vc;
-    [w makeKeyAndVisible];
-    w.hidden = NO;
-    g_win = w;
+// ⚠️ 关键: 不能用「全屏 UIWindow + rootViewController」承载悬浮 UI。
+//    那样 vc.view 会铺满全屏且 userInteractionEnabled=YES → hitTest 永远命中它,
+//    游戏的所有触摸被吃掉 (只能点到悬浮球)。踩坑记录。
+//    正解: ① 优先直接挂到游戏自己的 window; ② 拿不到时才建一个【可穿透】overlay,
+//         其 rootViewController.view 的 hitTest 在空白处返回 nil → 事件透传给下层游戏。
+static UIView *g_hostRoot = nil;      // 承载悬浮 UI 的根视图
 
+// ⚠️ 关键设计: 悬浮层必须【可穿透】, 否则会吃掉游戏的全部触摸 (本次真机反馈的问题)。
+//    做法 = 独立 overlay window + 重写 hitTest: 只有落在我们自己的子视图
+//    (悬浮球/面板及其子控件) 上才返回该视图, 其余一律返回 nil → 事件透传到下层游戏窗口。
+@interface GzzOverlayWin : UIWindow
+@end
+@implementation GzzOverlayWin
+- (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
+    UIView *v = [super hitTest:point withEvent:event];
+    if (!v) return nil;
+    if (v == self) return nil;                                   // 空白处 → 穿透
+    if (self.rootViewController && v == self.rootViewController.view) return nil;
+    return v;                                                    // 命中我们的控件
+}
+@end
+
+@interface GzzOverlayVC : UIViewController
+@end
+@implementation GzzOverlayVC
+- (BOOL)shouldAutorotate { return YES; }
+- (UIInterfaceOrientationMask)supportedInterfaceOrientations {
+    return UIInterfaceOrientationMaskAll;
+}
+@end
+
+// 找一个可参考的宿主窗口 (只用来同步尺寸/朝向, 不挂子视图)
+static UIWindow *gzz_game_window(void) {
+    UIWindow *best = nil;
+    for (UIWindow *w in [UIApplication sharedApplication].windows) {
+        if (w == g_win || w.hidden || w.alpha < 0.01) continue;
+        if (!best || w.windowLevel < best.windowLevel) best = w;
+    }
+    return best;
+}
+
+static void gzz_build_ui(void) {
     GzzHelper *H = [GzzHelper new];
     g_h = H;
+
+    // 独立可穿透 overlay (windowLevel 高于游戏、低于系统弹窗)
+    GzzOverlayWin *w = [[GzzOverlayWin alloc] initWithFrame:[UIScreen mainScreen].bounds];
+    w.windowLevel = UIWindowLevelNormal + 10;
+    w.backgroundColor = [UIColor clearColor];
+    w.opaque = NO;
+    GzzOverlayVC *vc = [GzzOverlayVC new];
+    w.rootViewController = vc;
+    w.hidden = NO;                 // ⚠️ 绝不 makeKeyAndVisible: 抢 key 会破坏游戏输入
+    g_win = w;
+    g_hostRoot = vc.view;
+    g_hostRoot.backgroundColor = [UIColor clearColor];
+    UIWindow *gw = gzz_game_window();
+    L("ui: 可穿透 overlay level=%.0f 已创建; 参考宿主窗口=%p (level=%.0f)",
+      w.windowLevel, gw, gw ? gw.windowLevel : -1);
+
+    UIView *vcv = g_hostRoot;
 
     // 悬浮球
     CGFloat bs = 56;
@@ -997,7 +1078,8 @@ static void gzz_build_ui(void) {
     g_ball.layer.shadowOffset = CGSizeMake(0, 2);
     [g_ball setTitle:@"战" forState:UIControlStateNormal];
     g_ball.titleLabel.font = [UIFont boldSystemFontOfSize:22];
-    [vc.view addSubview:g_ball];
+    [vcv addSubview:g_ball];
+    g_ball.hidden = YES;          // 由 helper 延迟到游戏启动完成后显示
 
     // 面板
     CGFloat pw = 268, ph = 348;
@@ -1007,7 +1089,7 @@ static void gzz_build_ui(void) {
     g_panel.layer.borderWidth = 1;
     g_panel.layer.borderColor = [UIColor colorWithWhite:1 alpha:0.22].CGColor;
     g_panel.hidden = YES;
-    [vc.view addSubview:g_panel];
+    [vcv addSubview:g_panel];
 
     UILabel *t = [[UILabel alloc] initWithFrame:CGRectMake(12, 8, pw - 60, 22)];
     t.text = @"古代战争助手 v1";
