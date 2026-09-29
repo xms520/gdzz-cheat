@@ -71,6 +71,7 @@ static volatile int g_nSkip   = 0;   // 自动跳过战斗次数
 static volatile int g_nDamage = 0;   // FeiJiEnemy::Damage 调用次数
 static volatile int g_nTsSet  = 0;   // set_timeScale 调用次数
 static volatile int g_nExc    = 0;   // C# 异常次数 (关键诊断)
+static volatile int g_nBoost  = 0;   // 战斗倍速施加次数
 
 static UIWindow *g_win  = nil;
 static UIButton *g_ball = nil;
@@ -141,14 +142,29 @@ typedef struct {
 static GzzApi A;
 static BOOL g_apiReady = NO;
 
-// 前向声明 (gzz_find_objects 需要)
+// ───────────────────────── 前向声明 (gzz_find_objects / tick 需要) ─────────────────────────
 static GzzMethodInfo *mi_findObjType  = NULL;
 static GzzMethodInfo *mi_setTimeScale = NULL;
 static GzzMethodInfo *mi_fjDamage     = NULL;
 static GzzMethodInfo *mi_fjCrash      = NULL;
 static GzzMethodInfo *mi_bpTiaoGuo    = NULL;
+static GzzMethodInfo *mi_bp2Ctor      = NULL;
+static GzzMethodInfo *mi_uiGetSpd     = NULL;
+static GzzMethodInfo *mi_spdBtnClick  = NULL;
 static int            mi_fjDamage_pt  = -1;
-static Il2CppClass   *k_fjEnemy = NULL, *k_bp = NULL;
+static int            mi_spdBtn_pt    = -1;
+static Il2CppClass   *k_fjEnemy = NULL, *k_bp = NULL, *k_bp2 = NULL, *k_ui = NULL, *k_spd = NULL;
+
+// ⭐ 核心决策 (v3.1): 回合战斗由客户端按服务器下发的 BattleLog 播放。
+//    「跳过(TiaoGuo)」= 放弃本场 → 判负 (真机日志已证实, 累计 11 次全是失败)。
+//    能"赢着秒完"的做法 = 把【播放速度】拉到极限, 战斗几秒播完 → 正常结算我方胜。
+static BOOL g_battleSpeedSet = NO;
+static BOOL g_useTiaoGuo     = NO;   // 是否使用 TiaoGuo (默认关: 会判负)
+static int  g_speedIdx       = 3;    // 战斗倍速档位
+static int  g_maxSpeedIdx    = 0;    // 由 GetNowBattleSpeed 探针发现的最大档位
+
+static void gzz_probe_speed(void);
+static void gzz_set_battle_speed(int idx);
 
 static void *GZ(const char *n) {
     void *p = dlsym(RTLD_DEFAULT, n);
@@ -269,6 +285,11 @@ static Il2CppObject *gzz_invoke(GzzMethodInfo *mi, void *self, void **args, cons
     return r;
 }
 
+// GZZ_SEEN_MAX / 去重表 (gzz_autoskip 与 gzz_boost_battle 共用)
+#define GZZ_SEEN_MAX 32
+static Il2CppObject *g_seen[GZZ_SEEN_MAX];
+static int            g_seenN = 0;
+
 // 场景内指定类的全部实例 (FindObjectsOfType(Type)); 元素起始偏移 32
 static int gzz_find_objects(Il2CppClass *k, Il2CppObject **out, int max) {
     if (!k || !A.type_get_object || !A.class_get_type) return 0;
@@ -289,7 +310,7 @@ static int gzz_find_objects(Il2CppClass *k, Il2CppObject **out, int max) {
 
 // ───────────────────────── 目标解析 ─────────────────────────
 static int g_tgtDone = 0;
-#define GZZ_NTGT 6
+#define GZZ_NTGT 11
 
 static void gzz_resolve_step(void) {
     if (g_tgtDone >= GZZ_NTGT) return;
@@ -330,9 +351,58 @@ static void gzz_resolve_step(void) {
         }
         case 5: {
             mi_bpTiaoGuo = k_bp ? gzz_find_method(k_bp, "TiaoGuo", 0) : NULL;
-            L("tgt: BattlePanel.TiaoGuo=%p", mi_bpTiaoGuo ? mi_bpTiaoGuo->methodPointer : NULL);
-            L("tgt: 解析完成 (FeiJiEnemy=%d Damage=%d TiaoGuo=%d)",
-              k_fjEnemy != NULL, mi_fjDamage != NULL, mi_bpTiaoGuo != NULL);
+            L("tgt: BattlePanel.TiaoGuo=%p (⚠️ 点了=判负, 默认不再调用)",
+              mi_bpTiaoGuo ? mi_bpTiaoGuo->methodPointer : NULL);
+            break;
+        }
+        case 6: {
+            k_bp2 = gzz_class("Assembly-CSharp", "JiuShiZhu", "BattlePanel2");
+            mi_bp2Ctor = k_bp2 ? gzz_find_method(k_bp2, "Create", 1) : NULL;
+            L("tgt: BattlePanel2=%p Create=%p", k_bp2,
+              mi_bp2Ctor ? mi_bp2Ctor->methodPointer : NULL);
+            break;
+        }
+        case 7: {
+            k_ui = gzz_class("Assembly-CSharp", "JiuShiZhu", "UIDataModel");
+            mi_uiGetSpd = k_ui ? gzz_find_method(k_ui, "GetNowBattleSpeed", 0) : NULL;
+            L("tgt: UIDataModel=%p GetNowBattleSpeed=%p", k_ui,
+              mi_uiGetSpd ? mi_uiGetSpd->methodPointer : NULL);
+            break;
+        }
+        case 8: {
+            k_spd = gzz_class("Assembly-CSharp", "JiuShiZhu", "BattleSpeedComponent");
+            if (k_spd) {
+                // BtnClick 有重载, 遍历所有同名方法打印参数个数供真机核对
+                void *iter = NULL; GzzMethodInfo *mi;
+                while (A.class_get_methods && (mi = A.class_get_methods(k_spd, &iter)) != NULL) {
+                    const char *mn = A.method_get_name(mi);
+                    if (!mn) continue;
+                    if (!strcmp(mn, "BtnClick")) {
+                        int pc = A.method_get_param_count ? A.method_get_param_count(mi) : -1;
+                        L("tgt: BattleSpeedComponent.BtnClick/%d = %p", pc, mi->methodPointer);
+                        if (mi_spdBtnClick == NULL) {
+                            mi_spdBtnClick = mi;
+                            mi_spdBtn_pt = -1;
+                            if (pc == 1 && A.method_get_param && A.type_get_type) {
+                                void *pt = A.method_get_param(mi, 0);
+                                if (pt) mi_spdBtn_pt = A.type_get_type(pt);
+                            }
+                        }
+                    }
+                }
+            }
+            L("tgt: BattleSpeedComponent=%p (BtnClick=%p paramType=%d)",
+              k_spd, mi_spdBtnClick ? mi_spdBtnClick->methodPointer : NULL, mi_spdBtn_pt);
+            break;
+        }
+        case 9: {
+            L("tgt: 解析完成 (FeiJi=%d Damage=%d BP2=%d UISpd=%d SpdBtn=%d)",
+              k_fjEnemy != NULL, mi_fjDamage != NULL, k_bp2 != NULL,
+              mi_uiGetSpd != NULL, mi_spdBtnClick != NULL);
+            break;
+        }
+        case 10: {
+            gzz_probe_speed();
             break;
         }
     }
@@ -369,17 +439,52 @@ static int gzz_kill_enemies(void) {
     return done;
 }
 
-// ② 回合战斗: 调 BattlePanel::TiaoGuo() 立即结算 (游戏自身"跳过"按钮的入口)
-//    用"场景内实例集合"做去重: 集合清空 (战斗结束) 后同一实例可再次触发。
-#define GZZ_SEEN_MAX 32
-static Il2CppObject *g_seen[GZZ_SEEN_MAX];
-static int            g_seenN = 0;
+// ② 回合战斗「秒完」—— 设置游戏自带的战斗倍速, 把 BattleLog 播放拉到极限。
+//    战斗会以极高速度播完, 玩家看不到过程 → 正常结算为我方胜。
+//    ⚠️ 不调用 TiaoGuo(): 那是"跳过=放弃本场", 直接判负 (真机日志已证实)。
+static void gzz_set_battle_speed(int idx) {
+    // 方式 A: 直接调用游戏的倍速组件按钮 (走游戏自己的逻辑, 最安全)
+    if (mi_spdBtnClick && k_spd) {
+        static Il2CppObject *buf[8];
+        int n = gzz_find_objects(k_spd, buf, 8);
+        for (int i = 0; i < n; i++) {
+            if (mi_spdBtn_pt == 9) {          // bool
+                bool b = true; void *a[1] = { &b };
+                gzz_invoke(mi_spdBtnClick, buf[i], a, "BattleSpeedComponent.BtnClick(bool)");
+            } else if (mi_spdBtn_pt == 8) {   // int
+                int32_t v = idx; void *a[1] = { &v };
+                gzz_invoke(mi_spdBtnClick, buf[i], a, "BattleSpeedComponent.BtnClick(int)");
+            } else {                           // 对象参数 (UI 事件) → 传 NULL 不可靠, 跳过
+                return;
+            }
+        }
+        if (n) return;
+    }
+    // 方式 B: 反复调用 GetNowBattleSpeed() 强制刷新显示 (部分实现会顺带更新内部倍速)
+    if (mi_uiGetSpd) gzz_invoke(mi_uiGetSpd, NULL, NULL, "UIDataModel.GetNowBattleSpeed");
+}
+
+// 探针: 读取游戏当前战斗倍速档位 (用于校准)
+static void gzz_probe_speed(void) {
+    static int logged = 0;
+    if (logged || !mi_uiGetSpd) return;
+    Il2CppObject *r = gzz_invoke(mi_uiGetSpd, NULL, NULL, "GetNowBattleSpeed");
+    if (r) {
+        int32_t v = *(int32_t *)((char *)r + sizeof(void *) * 2);
+        g_maxSpeedIdx = v;
+        L("probe: UIDataModel.GetNowBattleSpeed() = %d (最大档位)", v);
+        logged = 1;
+    }
+}
 
 static int gzz_autoskip(void) {
+    // v3.1: 默认不再自动跳过 (TiaoGuo = 判负)。
+    // 仅在用户显式打开开关时才调用, 便于对比两种行为。
+    if (!g_useTiaoGuo) return 0;
     static Il2CppObject *buf[32];
     if (!k_bp || !mi_bpTiaoGuo) return 0;
     int n = gzz_find_objects(k_bp, buf, 32);
-    if (n == 0) { g_seenN = 0; return 0; }     // 战斗结束 → 清空去重表
+    if (n == 0) { g_seenN = 0; return 0; }
     int did = 0;
     for (int i = 0; i < n; i++) {
         int known = 0;
@@ -388,17 +493,38 @@ static int gzz_autoskip(void) {
         if (g_seenN < GZZ_SEEN_MAX) g_seen[g_seenN++] = buf[i];
         gzz_invoke(mi_bpTiaoGuo, buf[i], NULL, "BattlePanel.TiaoGuo");
         did++;
-        L("kill: 自动跳过战斗 (BattlePanel=%p, 场景内 %d 个, 累计 %ld)",
-          buf[i], n, (long)(g_nSkip + 1));
+        L("kill: ⚠️ 调用了 TiaoGuo (跳过=判负) BattlePanel=%p", buf[i]);
     }
     g_nSkip += did;
     return did;
 }
 
+// 战斗实例出现 → 立刻把播放速度拉满
+static void gzz_boost_battle(void) {
+    if (k_bp2 || k_bp) {
+        Il2CppObject *dummy[4];
+        int n = 0;
+        if (k_bp)  n += gzz_find_objects(k_bp,  dummy, 4);
+        if (k_bp2) n += gzz_find_objects(k_bp2, dummy, 4);
+        if (n > 0) {
+            gzz_set_battle_speed(g_speedIdx); g_nBoost++;
+            if (!g_battleSpeedSet) {
+                g_battleSpeedSet = YES;
+                L("kill: 战斗中 → 已施加极限倍速 (档位 %d)", g_speedIdx);
+            }
+        } else if (g_battleSpeedSet) {
+            g_battleSpeedSet = NO;
+            g_seenN = 0;
+            L("kill: 战斗结束 → 复位倍速标记");
+        }
+    }
+}
+
 static void gzz_kill_pass(void) {
     if (!g_killOn) return;
-    gzz_kill_enemies();
-    gzz_autoskip();
+    gzz_kill_enemies();      // 飞机大战/探索小游戏敌人
+    gzz_boost_battle();      // 回合战斗: 极限加速播放
+    gzz_autoskip();          // 仅当 g_useTiaoGuo 打开 (默认关)
 }
 
 // ───────────────────────── 一次性探针 (诊断, 不修改任何内存) ─────────────────────────
@@ -425,11 +551,11 @@ static int   g_tick = 0;
 static BOOL  g_baseDone = NO;
 static NSString *gzz_stat_text(void) {
     return [NSString stringWithFormat:
-        @"跳过%ld  敌伤%ld  变速%ld  异常%ld\n"
-        @"目标%ld/%d  敌池%@  基址%@",
-        (long)g_nSkip, (long)g_nDamage, (long)g_nTsSet, (long)g_nExc,
-        (long)g_tgtDone, GZZ_NTGT,
-        k_fjEnemy ? @"OK" : @"--", g_unityBase ? @"OK" : @"--"];
+        @"战斗加速%ld  敌伤%ld  全局%ld  异常%ld\n"
+        @"倍速档%ld  目标%ld/%d  敌池%@",
+        (long)g_nBoost, (long)g_nDamage, (long)g_nTsSet, (long)g_nExc,
+        (long)g_maxSpeedIdx, (long)g_tgtDone, GZZ_NTGT,
+        k_fjEnemy ? @"OK" : @"--"];
 }
 
 static void gzz_tick(void) {
